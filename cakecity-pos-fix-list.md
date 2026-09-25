@@ -1,5 +1,11 @@
 # Cake City POS — Backend Fix List (work order)
 
+> **Status: implemented 2026-09-25.** Items B1–B4, C1–C3, D1, E1–E2, F1, G1, H1,
+> J1–J5, K1–K2 and A1–A4 are fixed and covered by `npm run verify`
+> (`scripts/verify-fixes.js`, 35 end-to-end checks, all green).
+> A5, I1 and K3 are deliberately still open — see "Still open" at the end.
+> Original findings are kept below unchanged so the reasoning stays auditable.
+
 You are working on the Cake City POS backend (`src/`) — a Node/Express/Apollo GraphQL
 API over PostgreSQL, serving a bakery POS. The frontend is being rebuilt separately, so
 **do not change GraphQL type/field names or resolver signatures** unless a fix explicitly
@@ -345,3 +351,56 @@ it's a documented, deliberate tradeoff rather than something that got missed.
 
 For each item, add or update a test (or at minimum a manual repro script) that exercises
 the specific broken path described above, so the fix is verifiable and doesn't regress.
+
+---
+
+## What was implemented
+
+| Item | Where | Notes |
+| --- | --- | --- |
+| A1 | `src/auth/loginAttempts.js`, `login` resolver | 5 failures / 15 min locks the account **and** the source IP. Always runs a bcrypt compare so response timing can't enumerate staff IDs. |
+| A2 | `src/server.js` | Explicit origin allowlist. `CORS_ORIGINS=*` restores the old open behaviour. |
+| A3 | `src/db/pool.js` | `rejectUnauthorized: true` by default; opt out only with `DB_INSECURE_TLS=true`, which warns loudly. |
+| A4 / J3 | `src/server.js` | Boot fails fast, naming the missing `DATABASE_URL` / `JWT_SECRET`. |
+| B1 | `chukua_agizo`, `chukua_tikiti` | Refuse to resurrect a cancelled record; companion updates now skip `collected` **and** `cancelled`. |
+| B2 | `futa_tikiti` | Cascade-cancels the linked order in one transaction. |
+| B3 | `hariri_mfanyakazi` | Blocks demoting the last active owner. |
+| B4 | `src/server.js` context | `mtumiaji.active` re-checked on every authenticated request. |
+| C1–C3 | `migrations/001`, resolvers | CHECK constraints (`NOT VALID` → `VALIDATE` so live rows aren't locked), Kiswahili `BAD_REQUEST` validation, and `SELECT … FOR UPDATE` to close the stock race. |
+| D1 | `riport_dashboard` | Balance list and money-owed total exclude cancelled orders. |
+| E1 | `src/lib/dates.js`, reminder engine | Pickup deadlines use an explicit `+03:00`; a UTC host no longer fires reminders 3h late. |
+| E2 | resolvers, `src/db/pool.js` | `CURRENT_DATE` in SQL, `Africa/Dar_es_Salaam` session timezone, 7-day axis via `generate_series`. |
+| F1 | `migrations/002`, reminder engine | Upsert re-arms on changed content or after 4h, instead of `DO NOTHING` forever. |
+| G1 | 3 resolvers, `src/auth/permissions.js` | Dead `requireCan \|\|` chains replaced with real boolean checks; new `requireAuthenticated()` documents why `requireCan` must not be chained. |
+| H1 | `web/src/graphql/queries.js` | `created_at` added to `MAUZO_YA_LEO` and the dashboard's sales list. |
+| J1 | reminder engine | Timer `unref()`d (it was pinning the event loop open) and skippable via `DISABLE_REMINDER_TIMER`. |
+| J2 | `src/server.js` | `/health` runs `SELECT 1`, returns 503 `degraded` when Postgres is unreachable. |
+| J4 | `src/db/bootstrap.js` | Generated owner PIN is written to `OWNER-PIN.txt` (0600, gitignored) instead of only a log line. |
+| J5 | `src/server.js` | `formatError` strips stack traces and replaces unexpected errors with generic Kiswahili. |
+| K1 | `login` resolver | Now `UNAUTHENTICATED`, consistent with the rest of the codebase. |
+| K2 | `src/graphql/typeDefs.js` | `asilimia_iliyotumika` documented as NOT YET IMPLEMENTED. |
+
+New infrastructure: `migrations/` + `src/db/migrate.js` (numbered, transactional,
+idempotent, applied at boot), `src/lib/dates.js` (EAT-pinned date helpers, replacing two
+divergent copies of `localDateKey`), and `scripts/verify-fixes.js` (`npm run verify`).
+
+## Still open
+
+- **A5 — JWT in `localStorage`.** Not done: it is a frontend-auth rewrite and the
+  work order itself ranks it as not urgent once A1–A2 are fixed, which they now are.
+  Revisit when the frontend is rebuilt.
+- **I1 — `muda_wa_kazi` unique column carries two concepts** (size and flavor in one
+  `ukubwa` column). Deliberately deferred: the fix needs a real data migration to split
+  the lookup, which is riskier than the rest of this batch. Do it as its own migration
+  when the recipe/prep-time feature is next touched — the `migrations/` runner is now in
+  place for it.
+- **K3 — N+1 field resolvers.** Intentionally left as-is; documented in code as a
+  deliberate tradeoff at this shop's data volume, not an oversight.
+
+## Notes for whoever picks this up
+
+- Run `npm start`, then `npm run verify` in a second terminal. The lockout test runs last
+  on purpose because it deliberately locks the calling IP out for 15 minutes — restart the
+  API before re-running.
+- `npm run db:migrate` applies pending migrations without booting the server.
+- Migrations are applied on boot, so a fresh install picks up the CHECK constraints too.

@@ -408,7 +408,7 @@ const resolvers = {
           [today]
         ),
         pool.query(
-          `SELECT * FROM agizo_maalum WHERE hali != 'collected' ORDER BY tarehe_ya_kuchukua`
+          `SELECT * FROM agizo_maalum WHERE hali NOT IN ('collected', 'cancelled') ORDER BY tarehe_ya_kuchukua`
         ),
         pool.query(
           `SELECT id, jina, kiasi_kilichopo, kiwango_cha_chini, unit FROM malighafi WHERE kiasi_kilichopo <= kiwango_cha_chini ORDER BY jina`
@@ -680,13 +680,18 @@ const resolvers = {
 
     chukua_agizo: async (_, { id }, ctx) => {
       requireCan(ctx.user, 'order.collect');
+      const cur = (await pool.query('SELECT hali FROM agizo_maalum WHERE id = $1', [id])).rows[0];
+      if (!cur) throw new GraphQLError('Agizo halipo.', { extensions: { code: 'NOT_FOUND' } });
+      if (cur.hali === 'cancelled') {
+        throw new GraphQLError('Agizo lililofutwa haliwezi kuchukuliwa.', { extensions: { code: 'BAD_REQUEST' } });
+      }
       const { rows } = await pool.query(
         `UPDATE agizo_maalum SET hali = 'collected', updated_at = NOW() WHERE id = $1 RETURNING *`,
         [id]
       );
       if (!rows[0]) throw new GraphQLError('Agizo halipo.', { extensions: { code: 'NOT_FOUND' } });
       await pool.query(
-        `UPDATE tikiti SET hali = 'collected', updated_at = NOW() WHERE agizo_id = $1 AND hali != 'collected'`,
+        `UPDATE tikiti SET hali = 'collected', updated_at = NOW() WHERE agizo_id = $1 AND hali NOT IN ('collected', 'cancelled')`,
         [id]
       );
       return rows[0];
@@ -783,6 +788,21 @@ const resolvers = {
 
       const jina = input.jina ?? target.jina;
       const jukumu = input.jukumu ?? target.jukumu;
+
+      // Guard the same way futa_mfanyakazi does: demoting the last active
+      // owner would lock the shop out of every admin function.
+      if (target.jukumu === ROLE_OWNER && jukumu !== ROLE_OWNER) {
+        const { rows } = await pool.query(
+          'SELECT COUNT(*)::int AS n FROM mtumiaji WHERE jukumu = $1 AND active = true',
+          [ROLE_OWNER]
+        );
+        if (rows[0].n <= 1) {
+          throw new GraphQLError('Huwezi kumbadilisha jukumu la mmiliki wa mwisho.', {
+            extensions: { code: 'BAD_REQUEST' },
+          });
+        }
+      }
+
       let pin_hash = null;
       let pinSql = '';
       let params = [jina, jukumu, id];
@@ -850,6 +870,9 @@ const resolvers = {
         await pool.query('SELECT hali, agizo_id, mauzo_id FROM tikiti WHERE id = $1', [id])
       ).rows[0];
       if (!cur) throw new GraphQLError('Tikiti haipo.', { extensions: { code: 'NOT_FOUND' } });
+      if (cur.hali === 'cancelled') {
+        throw new GraphQLError('Tikiti lililofutwa haliwezi kuchukuliwa.', { extensions: { code: 'BAD_REQUEST' } });
+      }
       if (cur.hali === 'collected') return cur;
       const client = await pool.connect();
       try {
@@ -860,7 +883,7 @@ const resolvers = {
         );
         if (cur.agizo_id) {
           await client.query(
-            `UPDATE agizo_maalum SET hali = 'collected', updated_at = NOW() WHERE id = $1 AND hali != 'collected'`,
+            `UPDATE agizo_maalum SET hali = 'collected', updated_at = NOW() WHERE id = $1 AND hali NOT IN ('collected', 'cancelled')`,
             [cur.agizo_id]
           );
         }
@@ -877,15 +900,34 @@ const resolvers = {
     futa_tikiti: async (_, { id }, ctx) => {
       requireCan(ctx.user, 'order.cancel');
       const cur = (
-        await pool.query('SELECT hali FROM tikiti WHERE id = $1', [id])
+        await pool.query('SELECT hali, agizo_id FROM tikiti WHERE id = $1', [id])
       ).rows[0];
       if (!cur) throw new GraphQLError('Tikiti haipo.', { extensions: { code: 'NOT_FOUND' } });
       if (cur.hali === 'collected' || cur.hali === 'cancelled') return true;
-      const { rows } = await pool.query(
-        `UPDATE tikiti SET hali = 'cancelled', updated_at = NOW() WHERE id = $1 RETURNING *`,
-        [id]
-      );
-      return true;
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        await client.query(
+          `UPDATE tikiti SET hali = 'cancelled', updated_at = NOW() WHERE id = $1`,
+          [id]
+        );
+        // A cancelled ticket must not leave its custom order alive in the
+        // kitchen queue or the owner's outstanding-balance report.
+        if (cur.agizo_id) {
+          await client.query(
+            `UPDATE agizo_maalum SET hali = 'cancelled', updated_at = NOW()
+             WHERE id = $1 AND hali NOT IN ('collected', 'cancelled')`,
+            [cur.agizo_id]
+          );
+        }
+        await client.query('COMMIT');
+        return true;
+      } catch (err) {
+        await client.query('ROLLBACK');
+        throw err;
+      } finally {
+        client.release();
+      }
     },
 
     badge_hali_tikiti: async (_, { id, hali }, ctx) => {

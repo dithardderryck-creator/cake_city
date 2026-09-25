@@ -37,10 +37,19 @@ async function startServer() {
         if (token) {
           const decoded = verifyToken(token);
           if (decoded) {
-            user = decoded;
+            // A fired staff member's JWT stays valid until it expires, so
+            // confirm the account is still active on every authenticated
+            // request. One extra indexed lookup is a fair price at this scale.
+            const { rows } = await pool.query(
+              'SELECT active FROM mtumiaji WHERE id = $1',
+              [decoded.sub]
+            );
+            if (rows[0] && rows[0].active) {
+              user = decoded;
+            }
           }
         }
-        return { user };
+        return { user, req };
       },
     })
   );

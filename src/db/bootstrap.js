@@ -5,6 +5,7 @@ const fs = require('fs');
 const path = require('path');
 const bcrypt = require('bcryptjs');
 const pool = require('./pool');
+const { runMigrations } = require('./migrate');
 
 const OWNER_INSERT = `INSERT INTO mtumiaji (jina, jukumu, pin_hash) VALUES ($1, 'owner', $2)`;
 
@@ -54,6 +55,13 @@ async function ensureDbInitialized() {
       await ensureOwner();
       console.log('Database already had schema; created missing initial owner account.');
     }
+  }
+
+  // Bring existing installs forward to the current schema version. Runs on
+  // every boot but applies each numbered step at most once.
+  const applied = await runMigrations();
+  if (applied.length > 0) {
+    console.log(`Applied ${applied.length} migration(s): ${applied.join(', ')}`);
   }
 }
 

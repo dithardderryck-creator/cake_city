@@ -544,14 +544,23 @@ const resolvers = {
         const perItems = [];
         let jumla = 0;
         for (const item of bidhaa) {
+          const kiasi = Number(item.kiasi);
+          if (!Number.isFinite(kiasi) || kiasi <= 0) {
+            throw new GraphQLError('Kiasi cha bidhaa lazima iwe zaidi ya sifuri.', {
+              extensions: { code: 'BAD_REQUEST' },
+            });
+          }
           const { rows } = await client.query(
             'SELECT * FROM bidhaa WHERE id = $1 AND active = true',
             [item.bidhaa_id]
           );
           if (!rows[0]) throw new GraphQLError(`Bidhaa ${item.bidhaa_id} haipo.`, { extensions: { code: 'NOT_FOUND' } });
-          const subtotal = Number(rows[0].bei) * item.kiasi;
-          perItems.push({ rows: rows[0], kiasi: item.kiasi, subtotal });
+          const subtotal = Number(rows[0].bei) * kiasi;
+          perItems.push({ rows: rows[0], kiasi, subtotal });
           jumla += subtotal;
+        }
+        if (punguzo != null && Number(punguzo) < 0) {
+          throw new GraphQLError('Punguzo haliwezi kuwa hasi.', { extensions: { code: 'BAD_REQUEST' } });
         }
         if (punguzo) jumla = Math.max(0, jumla - Number(punguzo));
         const risiti_no = `RS-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
@@ -586,6 +595,18 @@ const resolvers = {
     unda_agizo: async (_, { input }, ctx) => {
       const u = ctx.user;
       requireCan(u, 'order.create');
+      const bei_jumla = Number(input.bei_jumla);
+      const malipo_ya_awali = Number(input.malipo_ya_awali || 0);
+      if (!Number.isFinite(bei_jumla) || bei_jumla <= 0) {
+        throw new GraphQLError('Bei jumla lazima iwe zaidi ya sifuri.', { extensions: { code: 'BAD_REQUEST' } });
+      }
+      // A deposit above the total would make the generated salio column negative.
+      if (!Number.isFinite(malipo_ya_awali) || malipo_ya_awali < 0) {
+        throw new GraphQLError('Malipo ya awali haliwezi kuwa hasi.', { extensions: { code: 'BAD_REQUEST' } });
+      }
+      if (malipo_ya_awali > bei_jumla) {
+        throw new GraphQLError('Malipo ya awali hayawezi kuzidi bei jumla.', { extensions: { code: 'BAD_REQUEST' } });
+      }
       const client = await pool.connect();
       try {
         await client.query('BEGIN');
@@ -614,7 +635,7 @@ const resolvers = {
             input.ukubwa || null,
             input.tarehe_ya_kuchukua,
             input.bei_jumla,
-            input.malipo_ya_awali || 0,
+            malipo_ya_awali,
             u.sub,
           ]
         );
@@ -716,13 +737,10 @@ const resolvers = {
     log_matumizi: async (_, { input }, ctx) => {
       const u = ctx.user;
       requireCan(u, 'usage.create');
-      const ing = (
-        await pool.query('SELECT kiasi_kilichopo FROM malighafi WHERE id = $1', [input.malighafi_id])
-      ).rows[0];
-      if (!ing) throw new GraphQLError('Malighafi haipo.', { extensions: { code: 'NOT_FOUND' } });
-      if (Number(input.kiasi) > Number(ing.kiasi_kilichopo)) {
-        throw new GraphQLError('Kiasi kinachotumika kinazidi hisa iliyopo.', {
-          extensions: { code: 'INSUFFICIENT_STOCK' },
+      const kiasi = Number(input.kiasi);
+      if (!Number.isFinite(kiasi) || kiasi <= 0) {
+        throw new GraphQLError('Kiasi kinachotumika lazima kiwe zaidi ya sifuri.', {
+          extensions: { code: 'BAD_REQUEST' },
         });
       }
       const order = (
@@ -730,17 +748,55 @@ const resolvers = {
       ).rows[0];
       if (!order) throw new GraphQLError('Agizo halipo.', { extensions: { code: 'NOT_FOUND' } });
 
-      const { rows } = await pool.query(
-        `INSERT INTO kumbukumbu_matumizi (agizo_id, malighafi_id, kiasi, mpishi_id) VALUES ($1, $2, $3, $4) RETURNING *`,
-        [input.agizo_id, input.malighafi_id, input.kiasi, u.sub]
-      );
-      return rows[0];
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        // Lock the ingredient row so two concurrent usage logs against the same
+        // ingredient serialise here instead of both passing a stale stock check.
+        const ing = (
+          await client.query(
+            'SELECT kiasi_kilichopo FROM malighafi WHERE id = $1 FOR UPDATE',
+            [input.malighafi_id]
+          )
+        ).rows[0];
+        if (!ing) throw new GraphQLError('Malighafi haipo.', { extensions: { code: 'NOT_FOUND' } });
+        if (kiasi > Number(ing.kiasi_kilichopo)) {
+          throw new GraphQLError('Kiasi kinachotumika kinazidi hisa iliyopo.', {
+            extensions: { code: 'INSUFFICIENT_STOCK' },
+          });
+        }
+        const { rows } = await client.query(
+          `INSERT INTO kumbukumbu_matumizi (agizo_id, malighafi_id, kiasi, mpishi_id) VALUES ($1, $2, $3, $4) RETURNING *`,
+          [input.agizo_id, input.malighafi_id, kiasi, u.sub]
+        );
+        await client.query('COMMIT');
+        return rows[0];
+      } catch (err) {
+        await client.query('ROLLBACK');
+        // The malighafi CHECK (kiasi_kilichopo >= 0) is the hard backstop if a
+        // race still slips through; surface it as the same stock error.
+        if (err.code === '23514' || err.code === 'P0001') {
+          throw new GraphQLError('Kiasi kinachotumika kinazidi hisa iliyopo.', {
+            extensions: { code: 'INSUFFICIENT_STOCK' },
+          });
+        }
+        throw err;
+      } finally {
+        client.release();
+      }
     },
 
     marekebisho_hisa: async (_, { input }, ctx) => {
       const u = ctx.user;
       const perm = input.aina === 'restock' ? 'stock.adjust_restock' : 'stock.adjust_waste';
       requireCan(u, perm);
+      const kiasi = Number(input.kiasi);
+      // A negative "waste" would *increase* stock, the opposite of intent.
+      if (!Number.isFinite(kiasi) || kiasi <= 0) {
+        throw new GraphQLError('Kiasi cha marekebisho lazima kiwe zaidi ya sifuri.', {
+          extensions: { code: 'BAD_REQUEST' },
+        });
+      }
       const ing = (
         await pool.query('SELECT id FROM malighafi WHERE id = $1', [input.malighafi_id])
       ).rows[0];
@@ -749,16 +805,22 @@ const resolvers = {
       const client = await pool.connect();
       try {
         await client.query('BEGIN');
-        const delta = input.aina === 'restock' ? Number(input.kiasi) : -Number(input.kiasi);
+        const delta = input.aina === 'restock' ? kiasi : -kiasi;
         await client.query('UPDATE malighafi SET kiasi_kilichopo = kiasi_kilichopo + $1 WHERE id = $2', [delta, input.malighafi_id]);
         const { rows } = await client.query(
           `INSERT INTO marekebisho_hisa (malighafi_id, aina, kiasi, sababu, created_by) VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-          [input.malighafi_id, input.aina, input.kiasi, input.sababu || null, u.sub]
+          [input.malighafi_id, input.aina, kiasi, input.sababu || null, u.sub]
         );
         await client.query('COMMIT');
         return rows[0];
       } catch (err) {
         await client.query('ROLLBACK');
+        // Waste cannot exceed stock; CHECK (kiasi_kilichopo >= 0) caught it.
+        if (err.code === '23514' || err.code === 'P0001') {
+          throw new GraphQLError('Hisa haipo kiasi ya kutosha kwa marekebisho haya.', {
+            extensions: { code: 'INSUFFICIENT_STOCK' },
+          });
+        }
         throw err;
       } finally {
         client.release();

@@ -176,8 +176,25 @@ async function upsertReminder({ aina, lengo, agizo_id, malighafi_id, ujumbe, tar
   );
 }
 
-setInterval(() => {
-  generateUkumbusho().catch((e) => console.error('[ukumbusho] gen error:', e.message));
-}, 5 * 60 * 1000);
+/**
+ * Periodic reminder refresh.
+ *
+ * J1: an in-process interval assumes a long-running Node process, which is
+ * correct for the "runs on the shop's own PC" model. It is NOT correct for a
+ * serverless target, where a cold instance may be torn down before the
+ * interval fires and a warm instance can register duplicates. Set
+ * DISABLE_REMINDER_TIMER=true when running serverless and trigger generation
+ * from the existing tengeneza_ukumbusho mutation or an external cron instead.
+ *
+ * unref() keeps the timer from holding the event loop open, so `node
+ * src/server.js`, CLI scripts and tests can exit cleanly.
+ */
+const timerDisabled = process.env.DISABLE_REMINDER_TIMER === 'true';
+if (!timerDisabled) {
+  const timer = setInterval(() => {
+    generateUkumbusho().catch((e) => console.error('[ukumbusho] gen error:', e.message));
+  }, 5 * 60 * 1000);
+  if (typeof timer.unref === 'function') timer.unref();
+}
 
-module.exports = { generateUkumbusho, getPrepTime, predictStockFor };
+module.exports = { generateUkumbusho, getPrepTime, predictStockFor, REMINDER_REARM_HOURS };

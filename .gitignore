@@ -23,3 +23,6 @@ paketi-pos/
 
 # mac
 .DS_Store
+
+# Owner recovery notice — contains a live PIN, never commit
+OWNER-PIN.txt

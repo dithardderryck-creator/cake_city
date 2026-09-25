@@ -162,6 +162,12 @@ module.exports = gql`
     kiasi_kilichopo: Float!
     kiwango_cha_chini: Float!
     unit: String
+    """
+    NOT YET IMPLEMENTED — this always resolves to null. It depends on recipe
+    costing (the P2 feature), which does not exist yet. Do not build UI that
+    reads this value; use kiasi_kilichopo against kiwango_cha_chini for
+    low-stock indication until this is implemented.
+    """
     asilimia_iliyotumika: Float
   }
 

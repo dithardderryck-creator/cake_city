@@ -38,10 +38,10 @@ export const MAUZO = gql`
 
 export const MAUZO_YA_LEO = gql`
   query MauzoYaLeo {
-    mauzo_ya_leo {
-      id tarehe jumla njia_ya_malipo risiti_no
-      bidhaa { id kiasi bei bidhaa { jina } }
-    }
+      mauzo_ya_leo {
+        id tarehe jumla njia_ya_malipo risiti_no created_at
+        bidhaa { id kiasi bei bidhaa { jina } }
+      }
   }
 `
 
@@ -91,7 +91,7 @@ export const RIPORT_DASHBOARD = gql`
   query RiportDashboard {
     riport_dashboard {
       mauzo_ya_leo_total
-      mauzo_ya_leo { id tarehe jumla njia_ya_malipo risiti_no }
+        mauzo_ya_leo { id tarehe jumla njia_ya_malipo risiti_no created_at }
       mauzo_kwa_njia { njia jumla }
       mauzo_7_siku { tarehe jumla risiti }
       maagizo_ambayo_hajakusanywa {

@@ -2,6 +2,7 @@ const { GraphQLScalarType, Kind, GraphQLError } = require('graphql');
 const bcrypt = require('bcryptjs');
 const pool = require('../db/pool');
 const { signToken } = require('../auth/jwt');
+const { isLocked, recordFailure, clear } = require('../auth/loginAttempts');
 const { predictStockFor, generateUkumbusho, getPrepTime } = require('../reminders/engine');
 const { eatDateKey } = require('../lib/dates');
 const { nextTicketNumber, tikitishaMauzo, tikitishaAgizo } = require('../tickets/engine');
@@ -458,16 +459,41 @@ const resolvers = {
 
   Mutation: {
     login: async (_, { id, pin }, ctx) => {
+      // A1: lock out both the account and the source IP after repeated
+      // failures, so 4-digit PINs cannot be ground from either direction.
+      const ip = (ctx.req && (ctx.req.ip || ctx.req.socket?.remoteAddress)) || 'unknown';
+      const accountKey = `id:${id}`;
+      const ipKey = `ip:${ip}`;
+
+      if (isLocked(accountKey) || isLocked(ipKey)) {
+        throw new GraphQLError('Mwingiliano umefungiwa kwa muda. Jaribu tena baadaye.', {
+          extensions: { code: 'TOO_MANY_ATTEMPTS' },
+        });
+      }
+
       const { rows } = await pool.query(
         'SELECT * FROM mtumiaji WHERE id = $1 AND active = true',
         [id]
       );
       const u = rows[0];
-      if (!u || !(await bcrypt.compare(pin, u.pin_hash))) {
-        throw new GraphQLError('PIN si sahihi.', {
-          extensions: { code: 'UNAUTHORIZED' },
-        });
+      // Always run a bcrypt comparison so a missing/inactive account and a
+      // wrong PIN take the same time — otherwise response timing alone
+      // reveals which staff IDs exist.
+      const hash = u ? u.pin_hash : '$2a$10$invalidinvalidinvalidinvalidinvalidinvalidinvalidinvalidin';
+      const pinOk = await bcrypt.compare(String(pin ?? ''), hash);
+
+      if (!u || !pinOk) {
+        const left = Math.min(recordFailure(accountKey), recordFailure(ipKey));
+        throw new GraphQLError(
+          left > 0
+            ? `PIN si sahihi. Majaribio ${left} yaliyobaki.`
+            : 'PIN si sahihi. Mwingiliano umefungiwa kwa muda.',
+          { extensions: { code: 'UNAUTHENTICATED' } }
+        );
       }
+
+      clear(accountKey);
+      clear(ipKey);
       const token = signToken(u);
       return {
         token,

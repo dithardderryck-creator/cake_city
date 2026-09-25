@@ -129,7 +129,7 @@ src/
 web/
   src/                 React app (Apollo Client, Swahili UI)
   vite.config.js
-paketi-pos/            Windows/macOS installer artifacts (gitignored)
+installers/             Windows/macOS installers — built artifacts, not in the repo
 ```
 
 ---

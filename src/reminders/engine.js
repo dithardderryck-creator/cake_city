@@ -1,7 +1,5 @@
 const pool = require('../db/pool');
-
-const pad2 = (n) => String(n).padStart(2, '0');
-const localDateKey = (d) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+const { eatDateKey, eatNow, eatWallClock } = require('../lib/dates');
 
 /**
  * Mfumo wa Ukumbusho wa Mwongozaji (Guided Reminder Engine)
@@ -49,12 +47,14 @@ async function predictStockFor(malighafiId) {
     )
   ).rows[0];
   if (!ing || ing.kiasi_kilichopo <= 0) {
-    return { perDay: rows[0]?.per_day || 0, daysLeft: 0, depletionDate: new Date() };
+    return { perDay: rows[0]?.per_day || 0, daysLeft: 0, depletionDate: eatNow() };
   }
   const perDay = rows[0]?.per_day || 0;
   const daysLeft = perDay > 0 ? Math.floor(ing.kiasi_kilichopo / perDay) : 999;
-  const depletion = new Date();
-  depletion.setDate(depletion.getDate() + daysLeft);
+  // Add days on the EAT wall clock so the forecast date cannot slip a day
+  // when the host process runs in a different timezone.
+  const depletion = eatNow();
+  depletion.setUTCDate(depletion.getUTCDate() + daysLeft);
   return { perDay, daysLeft, depletionDate: depletion };
 }
 
@@ -73,8 +73,11 @@ async function generateUkumbusho() {
   for (const o of orders) {
     const prepMin = await getPrepTime(o.ladha, o.ukubwa);
     const isoDate = o.tarehe_chukua;
-    const pickup = new Date(`${isoDate}T17:00:00`);
-    const now = new Date();
+    // Pin the deadline to Tanzania time explicitly. Without the +03:00 offset
+    // JS parses this as the *host's* local time, so a UTC server would treat a
+    // 17:00 EAT pickup as 20:00 and fire "start baking now" three hours late.
+    const pickup = eatWallClock(isoDate, 17, 0);
+    const now = eatNow();
 
     const startBy = new Date(pickup.getTime() - prepMin * 60 * 1000);
     const hoursToPickup = (pickup - now) / 3600_000;
@@ -116,7 +119,7 @@ async function generateUkumbusho() {
       const msg =
         forecast.daysLeft <= 0
           ? `Hisa ya "${ing.jina}" imeisha. Jaza upya mara moja.`
-          : `Hisa ya "${ing.jina}" itaisha ndani ya siku ~${forecast.daysLeft} (kadirio ${localDateKey(forecast.depletionDate)}).`
+          : `Hisa ya "${ing.jina}" itaisha ndini ya siku ~${forecast.daysLeft} (kadirio ${eatDateKey(forecast.depletionDate)}).`
       await upsertReminder({
         aina: 'hisa_itakosa',
         lengo: 'inventory',
@@ -142,12 +145,34 @@ async function generateUkumbusho() {
   return true;
 }
 
+// How long a dismissed reminder stays quiet while its condition persists.
+// A new message (e.g. stock went from 3 days to 1 day left) re-arms it
+// immediately regardless of this window.
+const REMINDER_REARM_HOURS = 4;
+
 async function upsertReminder({ aina, lengo, agizo_id, malighafi_id, ujumbe, tarehe, muda }) {
   await pool.query(
     `INSERT INTO ukumbusho (aina, lengo, agizo_id, malighafi_id, ujumbe, tarehe_ya_utekelezaji, muda_inayopendekezwa)
      VALUES ($1, $2, $3, $4, $5, $6, $7)
-     ON CONFLICT (aina, lengo, COALESCE(agizo_id, 0), COALESCE(malighafi_id, 0)) DO NOTHING`,
-    [aina, lengo, agizo_id, malighafi_id, ujumbe, tarehe, muda]
+     ON CONFLICT (aina, lengo, COALESCE(agizo_id, 0), COALESCE(malighafi_id, 0))
+     DO UPDATE SET
+       ujumbe = EXCLUDED.ujumbe,
+       imesomwa = false,
+       tarehe_ya_utekelezaji = EXCLUDED.tarehe_ya_utekelezaji,
+       muda_inayopendekezwa = EXCLUDED.muda_inayopendekezwa,
+       updated_at = NOW()
+     WHERE ukumbusho.ujumbe IS DISTINCT FROM EXCLUDED.ujumbe
+        OR ukumbusho.updated_at < NOW() - ($8 || ' hours')::interval`,
+    [
+      aina,
+      lengo,
+      agizo_id,
+      malighafi_id,
+      ujumbe,
+      tarehe,
+      muda,
+      String(REMINDER_REARM_HOURS),
+    ]
   );
 }
 

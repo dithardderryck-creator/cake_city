@@ -3,6 +3,7 @@ const bcrypt = require('bcryptjs');
 const pool = require('../db/pool');
 const { signToken } = require('../auth/jwt');
 const { predictStockFor, generateUkumbusho, getPrepTime } = require('../reminders/engine');
+const { eatDateKey } = require('../lib/dates');
 const { nextTicketNumber, tikitishaMauzo, tikitishaAgizo } = require('../tickets/engine');
 const {
   ROLE_OWNER,
@@ -10,13 +11,16 @@ const {
   ROLE_CHEF,
   ROLE_INVENTORY,
   requireCan,
+  requireAuthenticated,
   can,
 } = require('../auth/permissions');
 
 const DateScalar = new GraphQLScalarType({
   name: 'Date',
-  description: 'Date (YYYY-MM-DD)',
-  serialize: (v) => (v instanceof Date ? localDateKey(v) : v),
+  description: 'Date (YYYY-MM-DD, Tanzania time)',
+  // Rendered in EAT so a date column never shifts a day because the host
+  // process runs in a different timezone.
+  serialize: (v) => (v instanceof Date ? eatDateKey(v) : v),
   parseValue: (v) => v,
   parseLiteral: (ast) => (ast.kind === Kind.STRING ? ast.value : null),
 });
@@ -29,7 +33,6 @@ const DateTimeScalar = new GraphQLScalarType({
 });
 
 const pad2 = (n) => String(n).padStart(2, '0');
-const localDateKey = (d) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
 
 const JSONScalar = new GraphQLScalarType({
   name: 'JSON',
@@ -268,19 +271,18 @@ const resolvers = {
     },
 
     mauzo_ya_leo: async (_, __, ctx) => {
-      // Cashier sees their own today sales; owner sees all today's sales.
-      const today = localDateKey(new Date());
+      // "Today" is decided by Postgres, not the Node process clock, so sales
+      // made at 00:00-03:00 EAT still land on the correct business day.
       if (ctx.user.jukumu === ROLE_CASHIER) {
         const { rows } = await pool.query(
-          `SELECT * FROM mauzo WHERE tarehe = $1 AND mfanyakazi_id = $2 ORDER BY created_at DESC`,
-          [today, ctx.user.sub]
+          `SELECT * FROM mauzo WHERE tarehe = CURRENT_DATE AND mfanyakazi_id = $1 ORDER BY created_at DESC`,
+          [ctx.user.sub]
         );
         return rows;
       }
       requireCan(ctx.user, 'sale.read_all');
       const { rows } = await pool.query(
-        `SELECT * FROM mauzo WHERE tarehe = $1 ORDER BY created_at DESC`,
-        [today]
+        `SELECT * FROM mauzo WHERE tarehe = CURRENT_DATE ORDER BY created_at DESC`
       );
       return rows;
     },
@@ -315,7 +317,7 @@ const resolvers = {
     },
 
     marekebisho_hisa: async (_, __, ctx) => {
-      requireCan(ctx.user, 'usage.read_all') || requireCan(ctx.user, 'stock.adjust_restock') || requireCan(ctx.user, 'stock.adjust_waste');
+      requireAuthenticated(ctx.user);
       if (!can(ctx.user, 'usage.read_all') && !can(ctx.user, 'stock.adjust_restock') && !can(ctx.user, 'stock.adjust_waste')) {
         throw new GraphQLError('Hamna ruhusa ya kuona marekebisho.', { extensions: { code: 'FORBIDDEN' } });
       }
@@ -341,8 +343,8 @@ const resolvers = {
     },
 
     utabiri_hisa: async (_, { kiasi_chini_ya_siku }, ctx) => {
-      requireCan(ctx.user, 'usage.read_all') || requireCan(ctx.user, 'stock.read');
-      if (!can(ctx.user, 'usage.read_all') && !can(ctx.user, 'stock.adjust_restock') && !can(ctx.user, 'stock.adjust_waste')) {
+      requireAuthenticated(ctx.user);
+      if (!can(ctx.user, 'usage.read_all') && !can(ctx.user, 'stock.read')) {
         throw new GraphQLError('Hamna ruhusa ya kuona utabiri.', { extensions: { code: 'FORBIDDEN' } });
       }
       const maxDays = kiasi_chini_ya_siku || 7;
@@ -398,14 +400,12 @@ const resolvers = {
 
     riport_dashboard: async (_, __, ctx) => {
       requireCan(ctx.user, 'report.access_dashboard');
-      const today = localDateKey(new Date());
 
       const [mauzoRes, totalRes, perMethodRes, balancesRes, lowRes, kitchenRes, weekRes] = await Promise.all([
-        pool.query('SELECT * FROM mauzo WHERE tarehe = $1 ORDER BY created_at DESC', [today]),
-        pool.query('SELECT COALESCE(SUM(jumla), 0)::float AS total FROM mauzo WHERE tarehe = $1', [today]),
+        pool.query('SELECT * FROM mauzo WHERE tarehe = CURRENT_DATE ORDER BY created_at DESC'),
+        pool.query('SELECT COALESCE(SUM(jumla), 0)::float AS total FROM mauzo WHERE tarehe = CURRENT_DATE'),
         pool.query(
-          'SELECT njia_ya_malipo, COALESCE(SUM(jumla), 0)::float AS jumla FROM mauzo WHERE tarehe = $1 GROUP BY njia_ya_malipo',
-          [today]
+          'SELECT njia_ya_malipo, COALESCE(SUM(jumla), 0)::float AS jumla FROM mauzo WHERE tarehe = CURRENT_DATE GROUP BY njia_ya_malipo'
         ),
         pool.query(
           `SELECT * FROM agizo_maalum WHERE hali NOT IN ('collected', 'cancelled') ORDER BY tarehe_ya_kuchukua`
@@ -416,31 +416,29 @@ const resolvers = {
         pool.query(
           `SELECT * FROM agizo_maalum WHERE hali IN ('in_progress', 'ready') ORDER BY tarehe_ya_kuchukua`
         ),
+        // The 7-day axis is built by Postgres so the day boundaries match the
+        // same CURRENT_DATE used above, and days with no sales still appear.
         pool.query(
-          `SELECT tarehe::date AS tarehe, COALESCE(SUM(jumla), 0)::float AS jumla, COUNT(*)::int AS risiti
-           FROM mauzo
-           WHERE tarehe >= CURRENT_DATE - INTERVAL '6 days'
-           GROUP BY tarehe::date
-           ORDER BY tarehe::date`
+          `SELECT d::date AS tarehe,
+                  COALESCE(SUM(m.jumla), 0)::float AS jumla,
+                  COUNT(m.id)::int AS risiti
+           FROM generate_series(
+                  CURRENT_DATE - INTERVAL '6 days',
+                  CURRENT_DATE,
+                  INTERVAL '1 day'
+                ) AS d
+           LEFT JOIN mauzo m
+             ON m.tarehe = d::date
+           GROUP BY d::date
+           ORDER BY d::date`
         ),
       ]);
 
-      const siku7 = (() => {
-        const byDay = new Map(weekRes.rows.map((r) => [localDateKey(r.tarehe), r]));
-        const out = [];
-        for (let d = 6; d >= 0; d--) {
-          const date = new Date();
-          date.setDate(date.getDate() - d);
-          const key = localDateKey(date);
-          const hit = byDay.get(key);
-          out.push({
-            tarehe: key,
-            jumla: hit ? hit.jumla : 0,
-            risiti: hit ? hit.risiti : 0,
-          });
-        }
-        return out;
-      })();
+      const siku7 = weekRes.rows.map((r) => ({
+        tarehe: r.tarehe,
+        jumla: r.jumla,
+        risiti: r.risiti,
+      }));
 
       return {
         mauzo_ya_leo: mauzoRes.rows,
@@ -918,7 +916,7 @@ const resolvers = {
     },
 
     tengeneza_ukumbusho: async (_, __, ctx) => {
-      requireCan(ctx.user, 'report.access_dashboard') || requireCan(ctx.user, 'stock.read');
+      requireAuthenticated(ctx.user);
       if (!can(ctx.user, 'report.access_dashboard') && !can(ctx.user, 'usage.read_all')) {
         throw new GraphQLError('Hamna ruhusa.', { extensions: { code: 'FORBIDDEN' } });
       }

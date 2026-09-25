@@ -59,14 +59,28 @@ function can(user, permission) {
 }
 
 function requireCan(user, permission, message = 'Hamna ruhusa ya kufanya hili.') {
-  if (!user) {
-    throw new GraphQLError('Lazima uingie. (Unauthorized)', {
-      extensions: { code: 'UNAUTHENTICATED' },
-    });
-  }
+  requireAuthenticated(user);
   if (!can(user, permission)) {
     throw new GraphQLError(message, {
       extensions: { code: 'FORBIDDEN', role: user.jukumu, permission },
+    });
+  }
+  return true;
+}
+
+/**
+ * Assert only that a caller is logged in, without demanding a specific
+ * permission. Use this before a hand-written `can(...) || can(...)` check so
+ * an anonymous caller still gets UNAUTHENTICATED rather than being told
+ * "forbidden" for a resource they could never see anyway.
+ *
+ * Note: never chain requireCan with `||` — it throws rather than returning
+ * false, so the second call is unreachable and any `if` after it is dead code.
+ */
+function requireAuthenticated(user) {
+  if (!user) {
+    throw new GraphQLError('Lazima uingie. (Unauthorized)', {
+      extensions: { code: 'UNAUTHENTICATED' },
     });
   }
   return true;
@@ -79,4 +93,5 @@ module.exports = {
   ROLE_INVENTORY,
   can,
   requireCan,
+  requireAuthenticated,
 };

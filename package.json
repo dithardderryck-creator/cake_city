@@ -1,0 +1,26 @@
+{
+  "name": "cakecity",
+  "version": "1.0.0",
+  "description": "Cake City POS backend - GraphQL API with role-based access control",
+  "main": "src/server.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "db:init": "node src/db/init.js",
+    "db:reset": "dropdb --if-exists cakecity && createdb cakecity && node src/db/init.js"
+  },
+  "dependencies": {
+    "@apollo/server": "^4.11.3",
+    "bcryptjs": "^3.0.3",
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "graphql": "^16.14.2",
+    "graphql-tag": "^2.12.7",
+    "jsonwebtoken": "^9.0.3",
+    "pg": "^8.23.0"
+  }
+}

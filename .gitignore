@@ -1,0 +1,25 @@
+# dependencies
+node_modules/
+
+# secrets — NEVER commit
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# build artifacts
+dist/
+build/
+web/dist/
+.vercel/
+
+# big carry artifacts (159M of binaries — not source)
+paketi-pos/
+*.dmg
+*.exe
+*.zip
+!UONGOZI-SETUP-Swahilia.md
+
+# mac
+.DS_Store

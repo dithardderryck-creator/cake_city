@@ -1,0 +1,10 @@
+.env
+.env.*
+!.env.example
+.DS_Store
+predictions_tab_redesign.html
+cake_shop_pos_spec.md
+node_modules
+web/node_modules
+web/dist
+api

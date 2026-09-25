@@ -122,7 +122,7 @@ src/
   auth/jwt.js          token sign/verify, role guard
   db/
     pool.js            PostgreSQL pool
-    schema.sql         16 tables (Kiswahili)
+    schema.sql         14 tables (Kiswahili)
     seed.sql           starter data
     init.js            applies schema + seed
   graphql/             typeDefs + resolvers

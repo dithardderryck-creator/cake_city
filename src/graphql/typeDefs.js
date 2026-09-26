@@ -117,16 +117,25 @@ module.exports = gql`
     design: String
     ukubwa: String
     tarehe_ya_kuchukua: Date!
-    bei_jumla: Float
-    malipo_ya_awali: Float
-    salio: Float
-    hali: HaliOrder!
-    muda_hitajika: Int
-    created_by: ID
-    created_at: DateTime
-    updated_at: DateTime
-    tikiti: Tikiti
-  }
+      bei_jumla: Float
+      malipo_ya_awali: Float
+      salio: Float
+      hali: HaliOrder!
+      muda_hitajika: Int
+      created_by: ID
+      created_at: DateTime
+      updated_at: DateTime
+      tikiti: Tikiti
+      malipo: Mauzo
+    }
+
+    # A payment taken against a special order. Recorded in the sales ledger and
+    # linked to the order, so the day's takings include money collected at the
+    # counter for an order as well as for goods sold over the till.
+    type MalipoJumla {
+      agizo: AgizoMaalum!
+      malipo: Mauzo!
+    }
 
   type MauzoBidhaa {
     id: ID!
@@ -145,6 +154,7 @@ module.exports = gql`
     created_at: DateTime
     bidhaa: [MauzoBidhaa!]!
     tikiti: Tikiti
+    agizo_id: ID
   }
 
   type KumbukumbuMatumizi {
@@ -273,16 +283,19 @@ module.exports = gql`
     siku_ya_kuzaliwa: Date
   }
 
-  input AgizoInput {
-    mteja_id: ID
-    mteja_mpya: MtejaInput
-    ladha: String!
-    design: String
-    ukubwa: String
-    tarehe_ya_kuchukua: Date!
-    bei_jumla: Float!
-    malipo_ya_awali: Float!
-  }
+    input AgizoInput {
+      mteja_id: ID
+      mteja_mpya: MtejaInput
+      ladha: String!
+      design: String
+      ukubwa: String
+      tarehe_ya_kuchukua: Date!
+      bei_jumla: Float!
+      malipo_ya_awali: Float!
+      # How the deposit was paid. Optional so existing callers keep working; it
+      # defaults to cash, and the till screen always sends it explicitly.
+      njia_ya_malipo: NjiaMalipo
+    }
 
   input MatumiziInput {
     agizo_id: ID!
@@ -313,6 +326,7 @@ module.exports = gql`
     ongeza_mteja(input: MtejaInput!): Mteja!
     unda_mauzo(bidhaa: [MauzoBidhaaInput!]!, njia_ya_malipo: NjiaMalipo!, punguzo: Float): Mauzo!
     unda_agizo(input: AgizoInput!): AgizoMaalum!
+    lipa_salio(id: ID!, kiasi: Float!, njia_ya_malipo: NjiaMalipo): MalipoJumla!
     badge_hali_order(id: ID!, hali: HaliOrder!): AgizoMaalum!
     chukua_agizo(id: ID!): AgizoMaalum!
     futa_agizo(id: ID!): Boolean!

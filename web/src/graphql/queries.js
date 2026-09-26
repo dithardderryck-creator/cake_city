@@ -39,9 +39,9 @@ export const MAUZO = gql`
 export const MAUZO_YA_LEO = gql`
   query MauzoYaLeo {
       mauzo_ya_leo {
-        id tarehe jumla njia_ya_malipo risiti_no created_at
-        bidhaa { id kiasi bei bidhaa { jina } }
-      }
+          id tarehe jumla njia_ya_malipo risiti_no created_at agizo_id
+          bidhaa { id kiasi bei bidhaa { jina } }
+        }
   }
 `
 

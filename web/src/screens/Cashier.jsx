@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { useQuery, useMutation } from '@apollo/client'
-import { BIDHAA, MAUZO_YA_LEO, AGIZO_MAALUM, UKUMBUSHO, TIKITI } from '../graphql/queries'
+import { BIDHAA, MAUZO_YA_LEO, AGIZO_MAALUM, UKUMBUSHO } from '../graphql/queries'
 import { UNDA_MAUZO, UNDA_AGIZO, CHUKUA_AGIZO } from '../graphql/mutations'
 import { Card, CardFull } from '../ui/Card'
 import { Btn } from '../ui/Btn'
@@ -9,7 +9,8 @@ import { Select } from '../ui/Select'
 import { StatusPill } from '../ui/charts'
 import { Modal } from '../ui/Modal'
 import { TicketSheet } from '../ui/TikitiCard'
-import { Plus, Minus, ShoppingBag, Cake, ListChecks, Receipt, ArrowRight, Check, Phone, BellRinging, Timer, Printer } from '@phosphor-icons/react'
+import CollectBalanceModal from '../ui/CollectBalanceModal'
+import { Plus, Minus, ShoppingBag, Cake, ListChecks, Receipt, ArrowRight, Check, Phone, BellRinging, Timer, Printer, Wallet } from '@phosphor-icons/react'
 
 const TABS = [
   { key: 'sale',    label: 'Mauzo',        icon: ShoppingBag },
@@ -188,36 +189,43 @@ function SalesTab() {
         )}
       </CardFull>
 
-      {/* Receipt + ticket modal */}
-      <Modal open={!!receiptOpen} onClose={() => setReceiptOpen(null)} title="Risiti na Tikiti" className="max-w-xl">
+      {/* Till receipt — counter sales are ready-to-eat, so no pickup ticket */}
+      <Modal open={!!receiptOpen} onClose={() => setReceiptOpen(null)} title="Risiti" className="max-w-xl">
         {receiptOpen && (
           <div className="flex flex-col items-center gap-4 text-center">
             <div className="w-12 h-12 rounded-full bg-sage/10 flex items-center justify-center">
               <Check weight="light" className="w-6 h-6 text-sage" />
             </div>
-            <p className="text-sm text-espresso-muted">Risiti namba</p>
-            <p className="font-serif text-lg font-semibold">{receiptOpen.risiti_no}</p>
-            <p className="cc-num text-3xl font-semibold">{fmtTSh(receiptOpen.jumla)}</p>
-            <StatusPill tone={PAYMENT_META[receiptOpen.njia_ya_malipo]?.tone || 'neutral'}>
-              {PAYMENT_LABELS[receiptOpen.njia_ya_malipo]}
-            </StatusPill>
-            <div className="flex flex-col gap-1 w-full max-w-[260px] mt-2">
+            <div>
+              <p className="text-sm text-espresso-muted">Risiti namba</p>
+              <p className="font-serif text-lg font-semibold">{receiptOpen.risiti_no}</p>
+            </div>
+
+            <div className="w-full max-w-[300px] flex flex-col gap-1.5 border-y border-hairline py-3">
               {receiptOpen.items.map((i) => (
-                <div key={i.id} className="flex items-center justify-between text-xs text-espresso-muted">
+                <div key={i.id} className="flex items-center justify-between text-sm">
                   <span className="truncate">{i.qty}× {i.name}</span>
-                  <span className="tabular-nums">{fmtTSh(i.price * i.qty)}</span>
+                  <span className="tabular-nums text-espresso-muted">{fmtTSh(i.price * i.qty)}</span>
                 </div>
               ))}
             </div>
 
-            {/* Numbered pickup ticket */}
-            <div className="w-full flex flex-col items-center my-2 border-t border-hairline pt-5">
-              <p className="text-[10px] uppercase tracking-[0.18em] text-espresso-muted mb-3">Tikiti yako ya kuchukua</p>
-              <TicketSheet ticket={receiptOpen.tikiti} />
-              <div className="flex gap-3 w-full mt-5">
-                <Btn variant="ghost" size="md" icon={Printer} className="flex-1" onClick={printTicket}>Chapisha</Btn>
-                <Btn variant="accent" size="md" iconRight={Phone} className="flex-1">WhatsApp</Btn>
+            <div>
+              <p className="cc-num text-3xl font-semibold">{fmtTSh(receiptOpen.jumla)}</p>
+              <div className="flex justify-center mt-2">
+                <StatusPill tone={PAYMENT_META[receiptOpen.njia_ya_malipo]?.tone || 'neutral'}>
+                  {PAYMENT_LABELS[receiptOpen.njia_ya_malipo]}
+                </StatusPill>
               </div>
+            </div>
+
+            <p className="text-xs text-espresso-muted max-w-[280px]">
+              Bidhaa zilizochaa tayari. Kwa agizo maalum linalohitajika kutengenezwa, tumia sehemu ya agizo.
+            </p>
+
+            <div className="flex gap-3 w-full mt-1">
+              <Btn variant="ghost" size="md" icon={Printer} className="flex-1" onClick={printTicket}>Chapisha</Btn>
+              <Btn variant="accent" size="md" iconRight={Phone} className="flex-1">WhatsApp</Btn>
             </div>
           </div>
         )}
@@ -233,13 +241,30 @@ function OrderTab() {
   })
   const [busy, setBusy] = useState(false)
   const [orderResult, setOrderResult] = useState(null)
+  // 'kamili' = paid in full, 'nusuri' = part payment (type the amount),
+  // 'bila' = nothing paid yet. Keeps the common cases to one tap and stops the
+  // cashier having to type the full price into the deposit box by hand.
+  const [payMode, setPayMode] = useState('nusuri')
+  const [orderPayment, setOrderPayment] = useState('cash')
+  const [orderErr, setOrderErr] = useState(null)
 
   const update = (k, v) => setForm((f) => ({ ...f, [k]: v }))
+
+  const applyPayMode = (mode) => {
+    setPayMode(mode)
+    if (mode === 'kamili') update('amali', form.bei || '')
+    else if (mode === 'bila') update('amali', '0')
+    // Entering 'nusuri' clears the box. Without this, switching Kamili -> Nusuri
+    // would leave the full price sitting in the deposit field, so the cashier
+    // could submit a full payment while believing they took part payment.
+    else if (mode === 'nusuri') update('amali', '')
+  }
 
   const submit = async (e) => {
     e.preventDefault()
     if (!form.ladha || !form.tarehe || !form.bei) return
     setBusy(true)
+    setOrderErr(null)
     try {
       const { data } = await undaaGizo({
         variables: {
@@ -251,12 +276,16 @@ function OrderTab() {
             tarehe_ya_kuchukua: form.tarehe,
             bei_jumla: Number(form.bei),
             malipo_ya_awali: Number(form.amali) || 0,
+            njia_ya_malipo: orderPayment,
           },
         },
       })
       setOrderResult(data.unda_agizo)
       setForm({ jina: '', simu: '', ladha: '', design: '', ukubwa: '', tarehe: '', bei: '', amali: '' })
-    } catch { /* noop — Apollo surfaces errors */ }
+      setPayMode('nusuri')
+    } catch (err) {
+      setOrderErr(err?.message || 'Agizo limeshindwa. Jaribu tena.')
+    }
     finally { setBusy(false) }
   }
 
@@ -281,18 +310,80 @@ function OrderTab() {
             <FieldSquare label="Ukubwa" value={form.ukubwa} onChange={(e) => update('ukubwa', e.target.value)} placeholder="Small / Medium / Large" />
           </div>
           <FieldSquare label="Muundo (Design)" value={form.design} onChange={(e) => update('design', e.target.value)} placeholder="Maelezo ya muundo..." />
-          <div className="grid grid-cols-2 gap-3">
-            <FieldSquare label="Tarehe ya kuchukua" type="date" required value={form.tarehe} onChange={(e) => update('tarehe', e.target.value)} />
-            <FieldSquare label="Bei (TSh)" type="number" min="0" required value={form.bei} onChange={(e) => update('bei', e.target.value)} placeholder="80000" />
-          </div>
-          <FieldSquare label="Malipo ya Awali (deposit)" type="number" min="0" value={form.amali} onChange={(e) => update('amali', e.target.value)} placeholder="0" />
-          <div className="flex items-center justify-between rounded-full bg-copper/[0.06] px-5 py-3">
-            <span className="text-xs font-medium text-copper">Salio la Kulipa</span>
-            <span className="cc-num text-lg font-semibold text-copper">{fmtTSh(Math.max(0, salio))}</span>
-          </div>
-          <Btn type="submit" variant="primary" size="lg" iconRight={ArrowRight} disabled={busy} className="w-full">
-            {busy ? 'Inaundwa...' : 'Unda Agizo'}
-          </Btn>
+            <div className="grid grid-cols-2 gap-3">
+              <FieldSquare label="Tarehe ya kuchukua" type="date" required value={form.tarehe} onChange={(e) => update('tarehe', e.target.value)} />
+              <FieldSquare label="Bei (TSh)" type="number" min="0" required value={form.bei} onChange={(e) => { update('bei', e.target.value); if (payMode === 'kamili') update('amali', e.target.value) }} placeholder="80000" />
+            </div>
+
+            <p className="cc-eyebrow mt-2 mb-1">Malipo</p>
+            <div className="grid grid-cols-3 gap-2">
+              {[
+                { key: 'kamili', label: 'Kamili', hint: 'Amepea yote' },
+                { key: 'nusuri', label: 'Nusuri', hint: 'Amepea sehemu' },
+                { key: 'bila',   label: 'Bado hayajalipwa', hint: 'Hakuna malipo' },
+              ].map((o) => (
+                <button
+                  key={o.key}
+                  type="button"
+                  onClick={() => applyPayMode(o.key)}
+                  disabled={!form.bei && o.key === 'kamili'}
+                  className={`flex flex-col items-center gap-0.5 px-2 py-2.5 rounded-xl text-center transition-all duration-300 ease-[cubic-bezier(0.32,0.72,0,1)] active:scale-[0.97] disabled:opacity-40 disabled:cursor-not-allowed ${
+                    payMode === o.key
+                      ? 'bg-copper text-white ring-1 ring-copper'
+                      : 'bg-espresso/[0.03] text-espresso-muted ring-1 ring-hairline hover:bg-espresso/[0.06]'
+                  }`}
+                >
+                  <span className="text-[11px] font-semibold leading-tight text-center">{o.label}</span>
+                  <span className={`text-[9px] leading-tight ${payMode === o.key ? 'text-white/75' : 'text-espresso-muted/60'}`}>{o.hint}</span>
+                </button>
+              ))}
+            </div>
+
+            {payMode === 'nusuri' && (
+              <FieldSquare label="Amepea (TSh)" type="number" min="0" max={beiNum || undefined} value={form.amali} onChange={(e) => update('amali', e.target.value)} placeholder="40000" />
+            )}
+
+            <div className="grid grid-cols-2 gap-3">
+              <div className="flex flex-col gap-1.5">
+                <span className="text-[11px] font-medium text-espresso-muted">Njia ya malipo</span>
+                <div className="grid grid-cols-2 gap-1.5">
+                  {Object.entries(PAYMENT_LABELS).map(([k, v]) => (
+                    <button
+                      key={k}
+                      type="button"
+                      onClick={() => setOrderPayment(k)}
+                      className={`px-2 py-2 rounded-lg text-[11px] font-semibold transition-all duration-300 active:scale-95 ${
+                        orderPayment === k ? 'bg-espresso text-cream' : 'bg-espresso/[0.04] text-espresso-muted hover:bg-espresso/[0.07]'
+                      }`}
+                    >
+                      {v}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-between rounded-full bg-copper/[0.06] px-5 py-3">
+              <span className="text-xs font-medium text-copper">Salio la Kulipa</span>
+              <span className="cc-num text-lg font-semibold text-copper">{fmtTSh(Math.max(0, salio))}</span>
+            </div>
+
+            {payMode === 'nusuri' && !amaliNum && (
+              <p className="text-[11px] text-espresso-muted/70">Weka kiasi ulicholipa. Kama hakuna malipo, chagua &ldquo;Bado hayajalipwa&rdquo;.</p>
+            )}
+
+            {amaliNum > beiNum && (
+              <p className="text-xs text-red-600">Malipo ya awali ni zaidi ya bei. Hakuna salio.</p>
+            )}
+
+            {orderErr && (
+              <p className="text-xs text-red-600 bg-red-50 rounded-lg px-3 py-2 ring-1 ring-red-200">{orderErr}</p>
+            )}
+
+            <Btn type="submit" variant="primary" size="lg" iconRight={ArrowRight} disabled={busy || !form.bei || amaliNum > beiNum || (payMode === 'nusuri' && !amaliNum)} className="w-full">
+              {busy ? 'Inaundwa...' : 'Unda Agizo'}
+            </Btn>
+
         </form>
       </CardFull>
 
@@ -325,6 +416,7 @@ function OrderTab() {
 function DueTab() {
   const { data, loading, refetch } = useQuery(AGIZO_MAALUM, { variables: { hali: null } })
   const [chukua] = useMutation(CHUKUA_AGIZO, { refetchQueries: [{ query: AGIZO_MAALUM }] })
+  const [paying, setPaying] = useState(null)
 
   const orders = (data?.agizo_maalum || []).filter((o) => o.hali !== 'collected' && o.hali !== 'cancelled')
   const sorted = [...orders].sort((a, b) => new Date(a.tarehe_ya_kuchukua) - new Date(b.tarehe_ya_kuchukua))
@@ -361,17 +453,34 @@ function DueTab() {
                 <span className="flex items-center gap-1 text-[11px] text-espresso-muted/70">
                   <Timer weight="light" className="w-3 h-3" /> Kadirio kuandaliwa: {o.muda_hitajika ? `${o.muda_hitajika} dk` : '—'} · Kuchukuliwa: {o.tarehe_ya_kuchukua}
                 </span>
-                {o.salio > 0 && <span className="text-[11px] text-copper font-medium">Salio: {fmtTSh(o.salio)}</span>}
+                {o.salio > 0
+                  ? <span className="text-[11px] text-copper font-medium">Salio: {fmtTSh(o.salio)} · kulipwa {fmtTSh(o.malipo_ya_awali)}</span>
+                  : <span className="text-[11px] text-sage font-medium">Imelipwa kamili</span>}
               </div>
-              {o.hali === 'ready' && (
-                <Btn variant="accent" size="sm" icon={Check} onClick={() => handleCollect(o.id)}>
-                  Imechukuliwa
-                </Btn>
-              )}
+              <div className="flex flex-col gap-2 shrink-0">
+                {o.salio > 0 && (
+                  <Btn variant="primary" size="sm" icon={Wallet} onClick={() => setPaying(o)}>
+                    Lipa Salio
+                  </Btn>
+                )}
+                {o.hali === 'ready' && (
+                  <Btn variant="accent" size="sm" icon={Check} onClick={() => handleCollect(o.id)}>
+                    Imechukuliwa
+                  </Btn>
+                )}
+              </div>
             </div>
           </Card>
         )
       })}
+
+      <CollectBalanceModal
+        key={paying?.id || 'none'}
+        order={paying}
+        onClose={() => setPaying(null)}
+        onDone={refetch}
+        refetchQueries={[{ query: AGIZO_MAALUM }, { query: MAUZO_YA_LEO }]}
+      />
     </div>
   )
 }
@@ -401,11 +510,17 @@ function ReceiptsTab() {
           <div className="flex items-center justify-between">
             <div className="flex flex-col gap-0.5">
               <span className="text-[10px] font-mono text-espresso-muted">{s.risiti_no}</span>
-              <span className="text-xs text-espresso-muted">{s.bidhaa.length} bidhaa · {new Date(s.created_at || s.tarehe).toLocaleTimeString('sw', { hour: '2-digit', minute: '2-digit' })}</span>
+              <span className="text-xs text-espresso-muted">
+                {s.agizo_id
+                  ? 'Agizo maalum'
+                  : `${(s.bidhaa || []).length} bidhaa`}
+                {' · '}
+                {new Date(s.created_at || s.tarehe).toLocaleTimeString('sw', { hour: '2-digit', minute: '2-digit' })}
+              </span>
             </div>
             <div className="flex items-center gap-3">
-              <StatusPill tone={PAYMENT_META[s.njia_ya_malipo]?.tone || 'neutral'}>
-                {PAYMENT_LABELS[s.njia_ya_malipo]}
+              <StatusPill tone={s.agizo_id ? 'copper' : (PAYMENT_META[s.njia_ya_malipo]?.tone || 'neutral')}>
+                {s.agizo_id ? 'Agizo' : PAYMENT_LABELS[s.njia_ya_malipo]}
               </StatusPill>
               <span className="cc-num text-base font-semibold">{fmtTSh(s.jumla)}</span>
             </div>

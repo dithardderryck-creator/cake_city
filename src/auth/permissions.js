@@ -42,6 +42,8 @@ const PERMISSIONS = {
   [ROLE_CHEF]: {
     'order.read_kitchen': true,
     'order.advance_status': true,
+    // The chef is the one handing the order over, so they close the ticket too.
+    'order.collect': true,
     'usage.create': true,
     'stock.read': true,
   },

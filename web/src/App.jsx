@@ -35,7 +35,7 @@ function Shell() {
   const RoleIcon = ROLE_ICONS[user.jukumu]
   const today = new Date().toLocaleDateString('sw', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })
   const canBoard = ['owner', 'cashier', 'chef'].includes(user.jukumu)
-  const [boardOpen, setBoardOpen] = useState(false)
+  const [showBoard, setShowBoard] = useState(false)
 
   return (
     <div className="min-h-[100dvh]">
@@ -51,7 +51,7 @@ function Shell() {
           <span className="w-px h-4 bg-espresso/[0.08] hidden sm:block" />
           <span className="text-[10px] text-espresso-muted/70 hidden md:block capitalize">{today}</span>
           <span className="w-px h-4 bg-espresso/[0.08]" />
-          {canBoard && <BoardToggle open={boardOpen} onToggle={() => setBoardOpen((v) => !v)} />}
+          {canBoard && <BoardToggle active={showBoard} onToggle={() => setShowBoard((v) => !v)} />}
           <ReminderBell />
           <button
             onClick={logout}
@@ -65,16 +65,17 @@ function Shell() {
 
       {/* ── Content ─────────────────────────────────────────── */}
       <div className="pt-20 pb-12 px-4 md:px-8 max-w-7xl mx-auto">
-        {user.jukumu === 'owner'     && <Owner />}
-        {user.jukumu === 'cashier'   && <Cashier />}
-        {user.jukumu === 'chef'      && <Chef />}
-        {user.jukumu === 'inventory' && <Inventory />}
+        {showBoard && canBoard ? (
+          <TicketBoard onBack={() => setShowBoard(false)} />
+        ) : (
+          <>
+            {user.jukumu === 'owner'     && <Owner />}
+            {user.jukumu === 'cashier'   && <Cashier />}
+            {user.jukumu === 'chef'      && <Chef />}
+            {user.jukumu === 'inventory' && <Inventory />}
+          </>
+        )}
       </div>
-
-      {/* ── Live Ticket Board ───────────────────────────────── */}
-      {canBoard && (
-        <TicketBoard open={boardOpen} onClose={() => setBoardOpen(false)} />
-      )}
     </div>
   )
 }

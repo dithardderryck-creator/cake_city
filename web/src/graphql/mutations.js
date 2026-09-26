@@ -15,6 +15,16 @@ export const UNDA_AGIZO = gql`
       id ladha ukubwa bei_jumla malipo_ya_awali salio hali
       mteja { id jina simu }
       tikiti { id namba tarehe aina hali jina maelezo jumla }
+      malipo { id jumla njia_ya_malipo risiti_no }
+    }
+  }
+`
+
+export const LIPA_SALIO = gql`
+  mutation LipaSalio($id: ID!, $kiasi: Float!, $njia_ya_malipo: NjiaMalipo) {
+    lipa_salio(id: $id, kiasi: $kiasi, njia_ya_malipo: $njia_ya_malipo) {
+      agizo { id ladha bei_jumla malipo_ya_awali salio hali }
+      malipo { id jumla njia_ya_malipo risiti_no }
     }
   }
 `

@@ -10,6 +10,7 @@ import { Modal } from '../ui/Modal'
 import { FieldSquare } from '../ui/Field'
 import { Select } from '../ui/Select'
 import { Sparkline, TrendChart, StatusPill } from '../ui/charts'
+import CollectBalanceModal from '../ui/CollectBalanceModal'
 import { ChartLineUp, Wallet, Package, ChefHat, UserPlus, Plus, XCircle, Bell, Hourglass, Pencil, Trash, Scroll } from '@phosphor-icons/react'
 
 const PAYMENT_LABELS = { cash: 'Taslimu', mpesa: 'M-Pesa', tigopesa: 'Tigo Pesa', airtel_money: 'Airtel Money' }
@@ -41,10 +42,11 @@ function SplitStat({ icon: Icon, label, value, sub, spark, sparkColor = '#C47F3D
 }
 
 function OverviewTab() {
-  const { data, loading } = useDash()
+  const { data, loading, refetch } = useDash()
   const { data: forecastData } = useQuery(UTABIRI_HISA, { variables: { kiasi_chini_ya_siku: 14 } })
   const { data: remindData } = useQuery(UKUMBUSHO)
   const [futaAgizo] = useMutation(FUTA_AGIZO, { refetchQueries: [{ query: RIPORT_DASHBOARD }] })
+  const [paying, setPaying] = useState(null)
 
   if (loading) return <div className="flex justify-center py-20"><div className="w-5 h-5 rounded-full border-2 border-copper border-t-transparent animate-spin" /></div>
   if (!data) return null
@@ -183,21 +185,40 @@ function OverviewTab() {
                 <p className="text-sm text-espresso-muted/70 text-center py-4">Hakuna salio za kudaiwa</p>
               </Card>
             )}
-            {(data.maagizo_ambayo_hajakusanywa || []).slice(0, 5).map((o) => (
+            {(data.maagizo_ambayo_hajakusanywa || []).slice(0, 8).map((o) => (
               <Card key={o.id} className="p-4 flex items-center justify-between gap-3">
                 <div className="min-w-0">
                   <p className="text-sm font-semibold truncate">{o.ladha} <span className="text-espresso-muted font-normal">({o.ukubwa || '—'})</span></p>
                   <p className="text-[11px] text-espresso-muted truncate">{o.mteja?.jina || 'Mteja'} · {o.tarehe_ya_kuchukua}</p>
+                  {o.hali === 'collected' && (
+                    <p className="text-[10px] text-copper font-medium mt-0.5">Amechukuliwa — bado hazjalipwa</p>
+                  )}
                 </div>
                 <div className="flex items-center gap-2 shrink-0">
                   <span className="cc-num text-base text-copper">{fmtTSh(o.salio)}</span>
+                  <Btn variant="primary" size="sm" icon={Wallet} onClick={() => setPaying(o)}>
+                    Lipa
+                  </Btn>
                   <Btn variant="ghost" size="sm" icon={XCircle} onClick={() => futaAgizo({ variables: { id: o.id } })} title="Futa">
                     Futa
                   </Btn>
                 </div>
               </Card>
             ))}
+            {(data.maagizo_ambayo_hajakusanywa || []).length > 8 && (
+              <p className="text-[11px] text-espresso-muted/60 text-center pt-1">
+                Na {(data.maagizo_ambayo_hajakusanywa || []).length - 8} zaidi hazionekani hapa
+              </p>
+            )}
           </div>
+
+          <CollectBalanceModal
+            key={paying?.id || 'none'}
+            order={paying}
+            onClose={() => setPaying(null)}
+            onDone={refetch}
+            refetchQueries={[{ query: RIPORT_DASHBOARD }]}
+          />
         </div>
       </div>
     </div>

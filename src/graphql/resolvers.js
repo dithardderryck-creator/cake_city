@@ -5,7 +5,7 @@ const { signToken } = require('../auth/jwt');
 const { isLocked, recordFailure, clear } = require('../auth/loginAttempts');
 const { predictStockFor, generateUkumbusho, getPrepTime } = require('../reminders/engine');
 const { eatDateKey } = require('../lib/dates');
-const { nextTicketNumber, tikitishaMauzo, tikitishaAgizo } = require('../tickets/engine');
+const { nextTicketNumber, tikitishaAgizo } = require('../tickets/engine');
 const {
   ROLE_OWNER,
   ROLE_CASHIER,
@@ -409,7 +409,13 @@ const resolvers = {
           'SELECT njia_ya_malipo, COALESCE(SUM(jumla), 0)::float AS jumla FROM mauzo WHERE tarehe = CURRENT_DATE GROUP BY njia_ya_malipo'
         ),
         pool.query(
-          `SELECT * FROM agizo_maalum WHERE hali NOT IN ('collected', 'cancelled') ORDER BY tarehe_ya_kuchukua`
+          // Outstanding money is owed whether or not the cake has been handed
+          // over. Filtering on hali here would drop a collected order that was
+          // still unpaid, hiding the debt from the owner entirely. Only fully
+          // settled orders and cancelled ones drop out.
+          `SELECT * FROM agizo_maalum
+           WHERE salio > 0 AND hali <> 'cancelled'
+           ORDER BY tarehe_ya_kuchukua`
         ),
         pool.query(
           `SELECT id, jina, kiasi_kilichopo, kiwango_cha_chini, unit FROM malighafi WHERE kiasi_kilichopo <= kiwango_cha_chini ORDER BY jina`
@@ -598,16 +604,11 @@ const resolvers = {
             [saleRes.rows[0].id, item.rows.id, item.kiasi, item.rows.bei]
           );
         }
-        const saleLine = perItems
-          .map((i) => (i.kiasi > 1 ? `${i.kiasi}× ${i.rows.jina}` : i.rows.jina))
-          .join(', ');
-        const tikiti = await tikitishaMauzo(client, {
-          mauzo_id: saleRes.rows[0].id,
-          jumla,
-          maelezo: saleLine,
-        });
-        await client.query('COMMIT');
-        return { ...saleRes.rows[0], tikiti };
+           await client.query('COMMIT');
+           // Counter sales are ready-to-eat goods handed over at the till, so they
+           // deliberately create no ticket: nothing for the kitchen to make. A
+           // ticket number is only issued for a custom order that needs preparing.
+           return { ...saleRes.rows[0], tikiti: null };
       } catch (err) {
         await client.query('ROLLBACK');
         throw err;
@@ -663,16 +664,34 @@ const resolvers = {
             u.sub,
           ]
         );
-        const agizo = rows[0];
-        const maelezo = `${agizo.ladha}${agizo.ukubwa ? ` — ${agizo.ukubwa}` : ''}`;
-        const tikiti = await tikitishaAgizo(client, {
-          agizo_id: agizo.id,
-          jumla: agizo.bei_jumla,
-          maelezo,
-          jina: mtejaJina,
-        });
-        await client.query('COMMIT');
-        return { ...agizo, tikiti };
+           const agizo = rows[0];
+           const maelezo = `${agizo.ladha}${agizo.ukubwa ? ` — ${agizo.ukubwa}` : ''}`;
+           const tikiti = await tikitishaAgizo(client, {
+             agizo_id: agizo.id,
+             jumla: agizo.bei_jumla,
+             maelezo,
+             jina: mtejaJina,
+           });
+           // Whatever was handed over at the counter is real money in the till,
+           // so it is written into the sales ledger and linked back to the order.
+           // A NULL malipo_ya_awali means "nothing paid yet" and records nothing.
+           let malipo = null;
+           if (Number(agizo.malipo_ya_awali) > 0) {
+             const sale = await client.query(
+               `INSERT INTO mauzo (mfanyakazi_id, jumla, njia_ya_malipo, risiti_no, agizo_id)
+                VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+               [
+                 u.sub,
+                 agizo.malipo_ya_awali,
+                 input.njia_ya_malipo || 'cash',
+                 `AG-${Date.now()}-${Math.floor(Math.random() * 10000)}`,
+                 agizo.id,
+               ]
+             );
+             malipo = sale.rows[0];
+           }
+           await client.query('COMMIT');
+           return { ...agizo, tikiti, malipo };
       } catch (err) {
         await client.query('ROLLBACK');
         throw err;
@@ -721,6 +740,66 @@ const resolvers = {
         );
       }
       return rows[0];
+    },
+
+    // Settle the outstanding balance on a special order at pickup. Takes money,
+    // so it is gated on sale.create (owner + cashier) and never the chef, and it
+    // writes the payment into the sales ledger exactly as the deposit was.
+    lipa_salio: async (_, { id, kiasi, njia_ya_malipo }, ctx) => {
+      const u = ctx.user;
+      requireCan(u, 'sale.create');
+      const amount = Number(kiasi);
+      if (!Number.isFinite(amount) || amount <= 0) {
+        throw new GraphQLError('Kiasi cha malipo lazima iwe zaidi ya sifuri.', {
+          extensions: { code: 'BAD_REQUEST' },
+        });
+      }
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        // Lock the order so two tills cannot both collect the same balance.
+        const { rows: curRows } = await client.query(
+          'SELECT * FROM agizo_maalum WHERE id = $1 FOR UPDATE',
+          [id]
+        );
+        const agizo = curRows[0];
+        if (!agizo) throw new GraphQLError('Agizo halipo.', { extensions: { code: 'NOT_FOUND' } });
+        if (agizo.hali === 'cancelled') {
+          throw new GraphQLError('Agizo lililofutwa haliwezi kupewa malipo.', {
+            extensions: { code: 'BAD_REQUEST' },
+          });
+        }
+        const saldo = Number(agizo.salio);
+        if (amount - saldo > 0.009) {
+          throw new GraphQLError(
+            `Malipo ni makubwa kuliko salio. Salio iliyobaki ni TSh ${Math.round(saldo)}.`,
+            { extensions: { code: 'BAD_REQUEST' } }
+          );
+        }
+        // salio is a generated column, so raising the amount paid recomputes it.
+        const { rows: upRows } = await client.query(
+          'UPDATE agizo_maalum SET malipo_ya_awali = malipo_ya_awali + $1, updated_at = NOW() WHERE id = $2 RETURNING *',
+          [amount, id]
+        );
+        const sale = await client.query(
+          `INSERT INTO mauzo (mfanyakazi_id, jumla, njia_ya_malipo, risiti_no, agizo_id)
+           VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+          [
+            u.sub,
+            amount,
+            njia_ya_malipo || 'cash',
+            `AG-${Date.now()}-${Math.floor(Math.random() * 10000)}`,
+            id,
+          ]
+        );
+        await client.query('COMMIT');
+        return { agizo: upRows[0], malipo: sale.rows[0] };
+      } catch (err) {
+        await client.query('ROLLBACK');
+        throw err;
+      } finally {
+        client.release();
+      }
     },
 
     chukua_agizo: async (_, { id }, ctx) => {

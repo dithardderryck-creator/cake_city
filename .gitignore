@@ -26,3 +26,6 @@ paketi-pos/
 
 # Owner recovery notice — contains a live PIN, never commit
 OWNER-PIN.txt
+
+# local database dumps — real shop data, never commit
+backups/

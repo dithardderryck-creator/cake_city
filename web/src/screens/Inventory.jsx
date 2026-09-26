@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { useQuery, useMutation } from '@apollo/client'
 import { useAuth } from '../auth'
-import { MALIGHAFI, KUMBUKUMBU_MATUMIZI, KUMBUKUMU_MATUMIZI, MAREKEBISHO_HISA, UTABIRI_HISA, MATUMIZI_KUSUBIRI } from '../graphql/queries'
+import { MALIGHAFI, KUMBUKUMU_MATUMIZI, MAREKEBISHO_HISA, UTABIRI_HISA, MATUMIZI_KUSUBIRI } from '../graphql/queries'
 import { MAREKEBISHO_HISA_MUT, ONGEZA_MALIGHAFI, HARIRI_MALIGHAFI, THIBITISHA_MATUMIZI } from '../graphql/mutations'
 import { Card, CardFull } from '../ui/Card'
 import { Btn } from '../ui/Btn'

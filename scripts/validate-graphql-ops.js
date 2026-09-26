@@ -5,7 +5,8 @@
 // kitchen. The schema comes from the app's own typeDefs module, not a copy, so
 // this cannot fall out of step with what the server actually serves.
 
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
+import { join } from 'node:path';
 import { createRequire } from 'node:module';
 import { buildSchema, parse, validate, specifiedRules } from 'graphql';
 
@@ -51,7 +52,53 @@ for (const f of files) {
 }
 
 console.log(`\n${total} operations checked, ${bad} invalid`);
+
+// A document can be perfectly valid and still never run, if a screen imports
+// it under a name the module does not export. Apollo then gets undefined as
+// its document and React throws: a white screen, on a green build. So resolve
+// every named import of these two modules across the whole web app.
+const importProblems = [];
+const exportsOf = Object.fromEntries(
+  files.map((f) => [
+    f,
+    new Set([...readFileSync(f, 'utf8').matchAll(/export const (\w+)/g)].map((m) => m[1])),
+  ])
+);
+
+const screens = [];
+(function walk(dir) {
+  for (const e of readdirSync(dir, { withFileTypes: true })) {
+    const p = join(dir, e.name);
+    if (e.isDirectory()) walk(p);
+    else if (/\.(jsx?|tsx?)$/.test(e.name)) screens.push(p);
+  }
+})('web/src');
+
+for (const screen of screens) {
+  const src = readFileSync(screen, 'utf8');
+  for (const mod of files) {
+    const base = mod.split('/').pop().replace(/\.js$/, '');
+    const re = new RegExp(
+      String.raw`import\s*\{([^}]+)\}\s*from\s*'[^']*graphql/${base}'`,
+      'g'
+    );
+    for (const m of src.matchAll(re)) {
+      for (const name of m[1].split(',').map((n) => n.trim()).filter(Boolean)) {
+        if (!exportsOf[mod].has(name)) {
+          importProblems.push(`${screen} imports ${name}, which ${mod} does not export`);
+        }
+      }
+    }
+  }
+}
+
+if (importProblems.length) {
+  bad += importProblems.length;
+  console.log(`\n  ${importProblems.length} unresolved import(s) across ${screens.length} files:`);
+  for (const p of importProblems) console.log(`   FAIL ${p}`);
+}
+
 if (bad) {
-  console.log('Broken: ' + failures.join(', '));
+  console.log('\nBroken: ' + [...failures, ...importProblems].join(', '));
   process.exit(1);
 }

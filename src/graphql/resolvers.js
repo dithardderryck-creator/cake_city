@@ -33,7 +33,41 @@ const DateTimeScalar = new GraphQLScalarType({
   parseLiteral: (ast) => (ast.kind === Kind.STRING ? ast.value : null),
 });
 
-const pad2 = (n) => String(n).padStart(2, '0');
+  const pad2 = (n) => String(n).padStart(2, '0');
+
+  /**
+   * Derive a product's family from its name.
+   *
+   * "Keki ya Chokoleti (dira 20)" -> "keki ya chokoleti"
+   *
+   * 'la' is rewritten to 'ya' because both are valid Swahili for "of", and
+   * leaving both spellings in place is precisely how the catalogue ended up
+   * with Cupcake la Chokoleti and Cupcake ya Chokoleti as two products. The
+   * family+size uniqueness rule cannot catch that split on its own, because
+   * the two names produce two different family strings and so never collide.
+   * Matched on surrounding spaces rather than \b, which PostgreSQL regex does
+   * not support as a word boundary.
+   *
+   * Every parenthetical group is dropped, not just a trailing one, so the
+   * result stays consistent with deriveUkubwa which finds the size wherever it
+   * appears. Stripping only a trailing "(...)" would leave the family as
+   * "keki ya ndau (dira 12)" for a name like "Keki ya Ndau (dira 12) fres".
+   */
+  const deriveFamilia = (name) =>
+    String(name)
+      .replace(/\([^)]*\)/g, ' ')
+      .replace(/\s+la\s+/gi, ' ya ')
+      .replace(/\s{2,}/g, ' ')
+      .trim()
+      .toLowerCase();
+
+  /** Derive the size: the parenthesised part of the name, else "nzuri". */
+  const deriveUkubwa = (explicit, name) => {
+    if (explicit && String(explicit).trim()) return String(explicit).trim().toLowerCase();
+    const m = String(name || '').match(/\(([^)]*)\)/);
+    return (m && m[1].trim() ? m[1] : 'nzuri').toLowerCase();
+  };
+
 
 const JSONScalar = new GraphQLScalarType({
   name: 'JSON',
@@ -46,12 +80,166 @@ const JSONScalar = new GraphQLScalarType({
   },
 });
 
+/**
+ * Shared insert path for BOTH the single-ingredient legacy mutation and the
+ * new batch one, so there is exactly one place that writes usage rows.
+ *
+ * Two things it deliberately does NOT do, because they are the whole point
+ * of the redesign:
+ *   1. It never checks current stock. The chef's number is an estimate made
+ *      mid-bake, and refusing to log "used 4kg" because 3kg showed on the
+ *      shelf would hide a real stock problem instead of surfacing it.
+ *   2. It never moves stock. Rows land as 'inakadiriwa' and sit in the
+ *      verification queue until inventory confirms the real number.
+ */
+const insertUsageBatch = async (_, { agizo_id, kumbukumbu, vitu, malighafi_id, kiasi }, ctx) => {
+  const u = ctx.user;
+  requireCan(u, 'usage.create');
+
+  const lines = (vitu || [{ malighafi_id, kiasi }]).map((l) => ({
+    malighafi_id: Number(l.malighafi_id),
+    kiasi: Number(l.kiasi),
+  }));
+  if (!lines.length) {
+    throw new GraphQLError('Hakuna kitu chochote kilichorekodiwa.', {
+      extensions: { code: 'BAD_REQUEST' },
+    });
+  }
+  for (const l of lines) {
+    if (!Number.isInteger(l.malighafi_id) || l.malighafi_id <= 0) {
+      throw new GraphQLError('Chagua malighafi.', { extensions: { code: 'BAD_REQUEST' } });
+    }
+    if (!Number.isFinite(l.kiasi) || l.kiasi <= 0) {
+      throw new GraphQLError('Kiasi kinachotumika lazima kiwe zaidi ya sifuri.', {
+        extensions: { code: 'BAD_REQUEST' },
+      });
+    }
+  }
+
+  // The tap grid lets the chef hit the same ingredient more than once, so
+  // fold repeats into a single summed row instead of storing three separate
+  // "flour 1" lines for inventory to verify one at a time.
+  const folded = new Map();
+  for (const l of lines) folded.set(l.malighafi_id, (folded.get(l.malighafi_id) || 0) + l.kiasi);
+  const merged = [...folded].map(([id, amt]) => ({ malighafi_id: id, kiasi: amt }));
+
+  // An entry with no order to explain it needs a note saying what it was
+  // for, otherwise "flour 2kg" is unattributable forever.
+  const note = kumbukumbu ? String(kumbukumbu).trim() : null;
+  if (!agizo_id && !note) {
+    throw new GraphQLError('Andika maelezo ya kile kundi (kwa mfano: "20 mandazi").', {
+      extensions: { code: 'BAD_REQUEST' },
+    });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    if (agizo_id) {
+      const order = (await client.query('SELECT id FROM agizo_maalum WHERE id = $1', [agizo_id])).rows[0];
+      if (!order) throw new GraphQLError('Agizo halipo.', { extensions: { code: 'NOT_FOUND' } });
+    }
+
+    // Reject retired ingredients: migration 004 kept the collapsed
+    // duplicates as inactive rows, and logging against those would move
+    // stock nobody is counting.
+    const ids = merged.map((l) => l.malighafi_id);
+    const found = (
+      await client.query('SELECT id FROM malighafi WHERE id = ANY($1::int[]) AND active', [ids])
+    ).rows.map((r) => r.id);
+    const missing = ids.filter((id) => !found.includes(id));
+    if (missing.length) {
+      throw new GraphQLError('Baadhi ya malighafi hayapatikani au yameondolewa.', {
+        extensions: { code: 'BAD_REQUEST', malighafi_ids: missing },
+      });
+    }
+
+    const out = [];
+    for (const l of merged) {
+      const { rows } = await client.query(
+        `INSERT INTO kumbukumbu_matumizi
+           (agizo_id, malighafi_id, kiasi, mpishi_id, hali, kumbukumbu)
+         VALUES ($1, $2, $3, $4, 'inakadiriwa', $5)
+         RETURNING *`,
+        [agizo_id || null, l.malighafi_id, l.kiasi, u.sub, note]
+      );
+      out.push(rows[0]);
+    }
+    await client.query('COMMIT');
+    return out;
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+};
+
+/**
+ * Validate + normalise a recipe's ingredient lines. Shared by create and
+ * edit so both reject the same mistakes the same way.
+ */
+const normaliseIngredients = async (client, viambato) => {
+  if (!Array.isArray(viambato) || !viambato.length) {
+    throw new GraphQLError('Mapishi lazima iwe na angalau kifungu kimoja.', {
+      extensions: { code: 'BAD_REQUEST' },
+    });
+  }
+  const out = [];
+  const seen = new Set();
+  for (const v of viambato) {
+    const mid = Number(v.malighafi_id);
+    const chini = Number(v.kiasi_cha_chini);
+    const juu = Number(v.kiasi_cha_juu);
+    if (!Number.isInteger(mid) || mid <= 0) {
+      throw new GraphQLError('Chagua malighafi.', { extensions: { code: 'BAD_REQUEST' } });
+    }
+    if (!Number.isFinite(chini) || !Number.isFinite(juu) || chini <= 0 || juu < chini) {
+      throw new GraphQLError('Kiasi cha chini na cha juu hazilingani.', {
+        extensions: { code: 'BAD_REQUEST' },
+      });
+    }
+    // A CHECK covers the min<=max case, but the unique key on
+    // (mapishi, material, sehemu) would raise a raw constraint error, so
+    // catch repeated ingredient+part here.
+    const sehemu = (v.sehemu && String(v.sehemu).trim()) || 'mfuatano';
+    const key = `${mid}|${sehemu}`;
+    if (seen.has(key)) {
+      throw new GraphQLError('Malighafi imewekwa mara mbili kwa sehemu hiyo.', {
+        extensions: { code: 'BAD_REQUEST', malighafi_id: mid, sehemu },
+      });
+    }
+    seen.add(key);
+    out.push({ malighafi_id: mid, kiasi_cha_chini: chini, kiasi_cha_juu: juu, sehemu });
+  }
+  const ids = [...new Set(out.map((o) => o.malighafi_id))];
+  const found = (await client.query('SELECT id FROM malighafi WHERE id = ANY($1::int[]) AND active', [ids]))
+    .rows.map((r) => r.id);
+  const missing = ids.filter((id) => !found.includes(id));
+  if (missing.length) {
+    throw new GraphQLError('Baadhi ya malighafi hayapatikani au yameondolewa.', {
+      extensions: { code: 'BAD_REQUEST', malighafi_ids: missing },
+    });
+  }
+  return out;
+};
+
 const resolvers = {
   Date: DateScalar,
   DateTime: DateTimeScalar,
   JSON: JSONScalar,
 
   AgizoMaalum: {
+    mapishi: async (order) => {
+      // A NULL mapishi_id IS the custom/off-book flag, so this stays nullable
+      // rather than throwing — the kitchen needs to see "no recipe, start empty".
+      if (!order.mapishi_id) return null;
+      const { rows } = await pool.query('SELECT * FROM mapishi WHERE id = $1', [
+        order.mapishi_id,
+      ]);
+      return rows[0] || null;
+    },
     mteja: async (order, _, ctx) => {
       if (!can(ctx.user, 'order.read_all')) return null;
       if (!order.mteja_id) return null;
@@ -120,6 +308,77 @@ const resolvers = {
       const { rows } = await pool.query(
         'SELECT id, jina, jukumu FROM mtumiaji WHERE id = $1',
         [log.mpishi_id]
+      );
+      return rows[0] || null;
+    },
+    imethibitishwa_na: async (log) => {
+      if (!log.imethibitishwa_na) return null;
+      const { rows } = await pool.query(
+        'SELECT id, jina, jukumu FROM mtumiaji WHERE id = $1',
+        [log.imethibitishwa_na]
+      );
+      return rows[0] || null;
+    },
+  },
+
+  Bidhaa: {
+    kategoria: async (p) => {
+      if (!p.kategoria_id) return null;
+      const { rows } = await pool.query('SELECT * FROM kategoria WHERE id = $1', [
+        p.kategoria_id,
+      ]);
+      return rows[0] || null;
+    },
+  },
+
+  Kategoria: {
+    bidhaa: async (k) => {
+      const { rows } = await pool.query(
+        'SELECT * FROM bidhaa WHERE kategoria_id = $1 AND active = true ORDER BY jina',
+        [k.id]
+      );
+      return rows;
+    },
+  },
+
+  Mapishi: {
+    viambato: async (m) => {
+      const { rows } = await pool.query(
+        'SELECT * FROM mapishi_kipengele WHERE mapishi_id = $1 ORDER BY id',
+        [m.id]
+      );
+      return rows;
+    },
+    mapishi_ibaba: async (m) => {
+      if (!m.mapishi_ibaba) return null;
+      const { rows } = await pool.query('SELECT * FROM mapishi WHERE id = $1', [
+        m.mapishi_ibaba,
+      ]);
+      return rows[0] || null;
+    },
+  },
+
+  MapishiKipengele: {
+    malighafi: async (line) => {
+      const { rows } = await pool.query('SELECT * FROM malighafi WHERE id = $1', [
+        line.malighafi_id,
+      ]);
+      return rows[0] || null;
+    },
+  },
+
+  Ombi: {
+    kutoka_kwa: async (o) => {
+      const { rows } = await pool.query(
+        'SELECT id, jina, jukumu FROM mtumiaji WHERE id = $1',
+        [o.kutoka_kwa]
+      );
+      return rows[0] || null;
+    },
+    kwenda_kwa: async (o) => {
+      const { rows } = await pool.query(
+        'SELECT id, jina, jukumu FROM mtumiaji WHERE id = $1',
+        [o.kwenda_kwa]
       );
       return rows[0] || null;
     },
@@ -298,24 +557,78 @@ const resolvers = {
       return rows;
     },
 
-    hisa: async (_, __, ctx) => {
-      requireCan(ctx.user, 'stock.read');
-      const { rows } = await pool.query(`SELECT * FROM malighafi ORDER BY jina`);
-      // Current quantity is source of truth; % used is derived once
-      // accumulated totals exist. Low-stock is flagged per threshold.
-      const items = rows.map((r) => ({
-        ...r,
-        asilimia_iliyotumika: null,
-      }));
-      const lowStock = rows.filter((r) => r.kiasi_kilichopo <= r.kiwango_cha_chini);
-      return { items, lowStock };
-    },
+      hisa: async (_, __, ctx) => {
+        requireCan(ctx.user, 'stock.read');
+        // `active` hides the duplicate ingredients collapsed in migration 004, so
+        // the chef's tap list and the low-stock panel show six real ingredients
+        // instead of twelve.
+        const { rows } = await pool.query(`SELECT * FROM malighafi WHERE active ORDER BY jina`);
+        // Current quantity is source of truth; % used is derived once
+        // accumulated totals exist. Low-stock is flagged per threshold.
+        const items = rows.map((r) => ({
+          ...r,
+          asilimia_iliyotumika: null,
+        }));
+        const lowStock = rows.filter((r) => r.kiasi_kilichopo <= r.kiwango_cha_chini);
+        return { items, lowStock };
+      },
 
-    malighafi: async (_, __, ctx) => {
-      requireCan(ctx.user, 'stock.read');
-      const { rows } = await pool.query('SELECT * FROM malighafi ORDER BY jina');
-      return rows;
-    },
+      malighafi: async (_, __, ctx) => {
+        requireCan(ctx.user, 'stock.read');
+        const { rows } = await pool.query(`SELECT * FROM malighafi WHERE active ORDER BY jina`);
+        return rows;
+      },
+
+      // Recipes, for custom cake orders. Defaults to active-only, matching the
+      // bidhaa query: pass active:false to include retired recipes.
+      mapishi: async (_, { active }, ctx) => {
+        requireCan(ctx.user, 'stock.read');
+        const activeCond = active === false ? '' : 'WHERE active = true';
+        const { rows } = await pool.query(`SELECT * FROM mapishi ${activeCond} ORDER BY ladha, ukubwa`);
+        return rows;
+      },
+
+      // Estimated usage still waiting on inventory. Joined to the order and its
+      // recipe because a bare "flour 4-5" tells the clerk nothing — they need
+      // to see which cake and how many to judge whether the number is sane.
+      kumbukumbu_matumizi_kusubiri: async (_, __, ctx) => {
+        requireCan(ctx.user, 'usage.verify');
+        const { rows } = await pool.query(
+          `SELECT k.*, a.ladha AS agizo_ladha, a.ukubwa AS agizo_ukubwa,
+                  m.ladha AS mapishi_ladha, m.ukubwa AS mapishi_ukubwa
+             FROM kumbukumbu_matumizi k
+             LEFT JOIN agizo_maalum a ON a.id = k.agizo_id
+             LEFT JOIN mapishi m       ON m.id = a.mapishi_id
+            WHERE k.hali = 'inakadiriwa'
+            ORDER BY k.tarehe DESC`
+        );
+        return rows;
+      },
+
+      kategoria: async (_, { active }, ctx) => {
+        requireCan(ctx.user, 'stock.read');
+        const activeCond = active === false ? '' : 'WHERE active = true';
+        const { rows } = await pool.query(`SELECT * FROM kategoria ${activeCond} ORDER BY jina`);
+        return rows;
+      },
+
+      ombi: async (_, { fungua }, ctx) => {
+        requireAuthenticated(ctx.user);
+        const params = [];
+        let sql = 'SELECT * FROM ombi';
+        if (fungua !== undefined && fungua !== null) {
+          // Map the boolean to the enum label rather than casting: passing the
+          // GraphQL boolean straight through arrives as the string "true",
+          // which is not a valid hali_ombi value.
+          params.push(fungua ? 'fungua' : 'imefanyika');
+          sql += ` WHERE hali = $${params.length}::hali_ombi`;
+        }
+        // Both directions are visible to everyone, so you can see what you
+        // asked for as well as what was asked of you. Open first.
+        sql += ` ORDER BY (hali = 'fungua') DESC, created_at DESC`;
+        const { rows } = await pool.query(sql, params);
+        return rows;
+      },
 
     marekebisho_hisa: async (_, __, ctx) => {
       requireAuthenticated(ctx.user);
@@ -509,20 +822,54 @@ const resolvers = {
 
     bathi_bidhaa: async (_, { input }, ctx) => {
       requireCan(ctx.user, 'product.manage');
+      const familia = deriveFamilia(input.familia || input.jina);
+      const ukubwa = deriveUkubwa(input.ukubwa, input.jina);
+      // Friendly message before the index rejects it, so the owner gets
+      // "a product with that family and size already exists" rather than a raw
+      // constraint violation. The index is still the real backstop.
+      const dupe = await pool.query(
+        `SELECT id, jina FROM bidhaa
+          WHERE active = true AND LOWER(familia) = LOWER($1) AND LOWER(ukubwa) = LOWER($2)`,
+        [familia, ukubwa]
+      );
+      if (dupe.rows[0]) {
+        throw new GraphQLError(
+          `Bidhaa yenye familia "${familia}" na ukubwa "${ukubwa}" tayari ipo (${dupe.rows[0].jina}).`,
+          { extensions: { code: 'BAD_REQUEST', existing_id: dupe.rows[0].id } }
+        );
+      }
       const { rows } = await pool.query(
-        'INSERT INTO bidhaa (jina, bei, aina) VALUES ($1, $2, $3) RETURNING *',
-        [input.jina, input.bei, input.aina || null]
+        `INSERT INTO bidhaa (jina, bei, aina, familia, ukubwa, kategoria_id)
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+        [input.jina, input.bei, input.aina || null, familia, ukubwa, input.kategoria_id || null]
       );
       return rows[0];
     },
 
     hariri_bidhaa: async (_, { id, input }, ctx) => {
       requireCan(ctx.user, 'product.manage');
-      const { rows } = await pool.query(
-        `UPDATE bidhaa SET jina = $1, bei = $2, aina = $3 WHERE id = $4 RETURNING *`,
-        [input.jina, input.bei, input.aina || null, id]
+      const cur = (await pool.query('SELECT jina, familia, ukubwa FROM bidhaa WHERE id = $1', [id])).rows[0];
+      if (!cur) throw new GraphQLError('Bidhaa haipo.', { extensions: { code: 'NOT_FOUND' } });
+      const familia = deriveFamilia(input.familia || cur.familia || input.jina || cur.jina);
+      const ukubwa = deriveUkubwa(input.ukubwa, input.ukubwa || cur.ukubwa || input.jina || cur.jina);
+      const dupe = await pool.query(
+        `SELECT id, jina FROM bidhaa
+          WHERE active = true AND id <> $1
+            AND LOWER(familia) = LOWER($2) AND LOWER(ukubwa) = LOWER($3)`,
+        [id, familia, ukubwa]
       );
-      if (!rows[0]) throw new GraphQLError('Bidhaa haipo.', { extensions: { code: 'NOT_FOUND' } });
+      if (dupe.rows[0]) {
+        throw new GraphQLError(
+          `Bidhaa yenye familia "${familia}" na ukubwa "${ukubwa}" tayari ipo (${dupe.rows[0].jina}).`,
+          { extensions: { code: 'BAD_REQUEST', existing_id: dupe.rows[0].id } }
+        );
+      }
+      const { rows } = await pool.query(
+        `UPDATE bidhaa SET jina = $1, bei = $2, aina = $3, familia = $4, ukubwa = $5,
+                           kategoria_id = COALESCE($6, kategoria_id)
+          WHERE id = $7 RETURNING *`,
+        [input.jina, input.bei, input.aina || null, familia, ukubwa, input.kategoria_id || null, id]
+      );
       return rows[0];
     },
 
@@ -649,10 +996,24 @@ const resolvers = {
           ).rows[0];
           mtejaJina = m?.jina;
         }
+        // Link the order to a recipe from the book. This is what makes the
+        // chef's tap sheet prefill instead of starting blank, so it is set
+        // here rather than inferred later. Validated against an ACTIVE recipe:
+        // a retired recipe should not silently prefill a new order.
+        let mapishiId = null;
+        if (input.mapishi_id) {
+          const rec = (
+            await client.query('SELECT id FROM mapishi WHERE id = $1 AND active', [input.mapishi_id])
+          ).rows[0];
+          if (!rec) {
+            throw new GraphQLError('Mapishi hakupatikani.', { extensions: { code: 'NOT_FOUND' } });
+          }
+          mapishiId = rec.id;
+        }
         const { rows } = await client.query(
           `INSERT INTO agizo_maalum
-           (mteja_id, ladha, design, ukubwa, tarehe_ya_kuchukua, bei_jumla, malipo_ya_awali, hali, created_by)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, 'ordered', $8) RETURNING *`,
+           (mteja_id, ladha, design, ukubwa, tarehe_ya_kuchukua, bei_jumla, malipo_ya_awali, hali, created_by, mapishi_id)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, 'ordered', $8, $9) RETURNING *`,
           [
             mtejaId,
             input.ladha,
@@ -662,6 +1023,7 @@ const resolvers = {
             input.bei_jumla,
             malipo_ya_awali,
             u.sub,
+            mapishiId,
           ]
         );
            const agizo = rows[0];
@@ -837,57 +1199,303 @@ const resolvers = {
       return true;
     },
 
+    /** Superseded by log_matumizi_kundi; kept so no old client breaks. */
     log_matumizi: async (_, { input }, ctx) => {
-      const u = ctx.user;
-      requireCan(u, 'usage.create');
-      const kiasi = Number(input.kiasi);
-      if (!Number.isFinite(kiasi) || kiasi <= 0) {
-        throw new GraphQLError('Kiasi kinachotumika lazima kiwe zaidi ya sifuri.', {
+      const [row] = await insertUsageBatch(
+        _,
+        { agizo_id: input.agizo_id, kumbukumbu: null, vitu: null,
+          malighafi_id: input.malighafi_id, kiasi: input.kiasi },
+        ctx
+      );
+      return row;
+    },
+
+    log_matumizi_kundi: (_, { input }, ctx) =>
+      insertUsageBatch(_, input, ctx),
+
+    /**
+     * The point stock actually moves. The DB trigger on kumbukumbu_matumizi
+     * does the decrement when hali flips to 'imethibitishwa', so this resolver
+     * must NOT also subtract by hand or stock would be reduced twice.
+     */
+    thibitisha_matumizi: async (_, { id, kiasi_halisi }, ctx) => {
+      requireCan(ctx.user, 'usage.verify');
+      const halisi = Number(kiasi_halisi);
+      if (!Number.isFinite(halisi) || halisi < 0) {
+        throw new GraphQLError('Kiasi halisi lazima kiwe namba isiyo chini ya sifuri.', {
           extensions: { code: 'BAD_REQUEST' },
         });
       }
-      const order = (
-        await pool.query('SELECT hali, created_by FROM agizo_maalum WHERE id = $1', [input.agizo_id])
-      ).rows[0];
-      if (!order) throw new GraphQLError('Agizo halipo.', { extensions: { code: 'NOT_FOUND' } });
 
       const client = await pool.connect();
       try {
         await client.query('BEGIN');
-        // Lock the ingredient row so two concurrent usage logs against the same
-        // ingredient serialise here instead of both passing a stale stock check.
-        const ing = (
-          await client.query(
-            'SELECT kiasi_kilichopo FROM malighafi WHERE id = $1 FOR UPDATE',
-            [input.malighafi_id]
-          )
+        // Lock the row so a double-tap on the confirm button cannot run the
+        // UPDATE twice.
+        const cur = (
+          await client.query('SELECT * FROM kumbukumbu_matumizi WHERE id = $1 FOR UPDATE', [id])
         ).rows[0];
-        if (!ing) throw new GraphQLError('Malighafi haipo.', { extensions: { code: 'NOT_FOUND' } });
-        if (kiasi > Number(ing.kiasi_kilichopo)) {
-          throw new GraphQLError('Kiasi kinachotumika kinazidi hisa iliyopo.', {
-            extensions: { code: 'INSUFFICIENT_STOCK' },
+        if (!cur) throw new GraphQLError('Kumbukumbu halipo.', { extensions: { code: 'NOT_FOUND' } });
+        if (cur.hali === 'imethibitishwa') {
+          throw new GraphQLError('Kumbukumbu hii tayari imethibitishwa.', {
+            extensions: { code: 'ALREADY_VERIFIED' },
           });
         }
+        if (cur.kiasi_halisi !== null) {
+          throw new GraphQLError('Kiasi halisi kimeweka tayari.', {
+            extensions: { code: 'ALREADY_VERIFIED' },
+          });
+        }
+        // halisi = 0 means "this ingredient was not actually used" (a cancelled
+        // line or a mis-tap). It still marks the row verified, so the trigger
+        // subtracts zero and the line stops sitting in the queue forever.
         const { rows } = await client.query(
-          `INSERT INTO kumbukumbu_matumizi (agizo_id, malighafi_id, kiasi, mpishi_id) VALUES ($1, $2, $3, $4) RETURNING *`,
-          [input.agizo_id, input.malighafi_id, kiasi, u.sub]
+          `UPDATE kumbukumbu_matumizi
+              SET hali = 'imethibitishwa', kiasi_halisi = $2,
+                  imethibitishwa_na = $3, tarehe_ya_uthibitisho = now()
+            WHERE id = $1
+            RETURNING *`,
+          [id, halisi, ctx.user.sub]
         );
         await client.query('COMMIT');
         return rows[0];
       } catch (err) {
         await client.query('ROLLBACK');
-        // The malighafi CHECK (kiasi_kilichopo >= 0) is the hard backstop if a
-        // race still slips through; surface it as the same stock error.
-        if (err.code === '23514' || err.code === 'P0001') {
-          throw new GraphQLError('Kiasi kinachotumika kinazidi hisa iliyopo.', {
-            extensions: { code: 'INSUFFICIENT_STOCK' },
-          });
-        }
         throw err;
       } finally {
         client.release();
       }
     },
+
+    unda_mapishi: async (_, { input }, ctx) => {
+      requireCan(ctx.user, 'recipe.manage');
+      const ladha = String(input.ladha || '').trim();
+      const ukubwa = String(input.ukubwa || '').trim();
+      if (!ladha || !ukubwa) {
+        throw new GraphQLError('Jina na ukubwa wa mapishi vinahitajika.', {
+          extensions: { code: 'BAD_REQUEST' },
+        });
+      }
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const lines = await normaliseIngredients(client, input.viambato);
+
+        // mapishi has UNIQUE(ladha, ukubwa) across ALL rows including inactive
+        // ones, so a soft-deleted recipe would otherwise permanently block
+        // re-authoring the same cake. Revive it instead.
+        const prior = (
+          await client.query('SELECT * FROM mapishi WHERE ladha = $1 AND ukubwa = $2', [ladha, ukubwa])
+        ).rows[0];
+
+        let id;
+        if (prior && prior.active) {
+          throw new GraphQLError(`Mapishi "${ladha}" (${ukubwa}) tayari upo.`, {
+            extensions: { code: 'ALREADY_EXISTS', existing_id: prior.id },
+          });
+        }
+        if (prior) {
+          await client.query(
+            `UPDATE mapishi SET active = true, dakika_kadirio = $2, mapamba_variant = $3,
+                               mapishi_ibaba = $4, created_by = $5, created_at = now()
+              WHERE id = $1`,
+            [prior.id, input.dakika_kadirio || 90, input.mapamba_variant || 'own_recipe',
+             input.mapishi_ibaba || null, ctx.user.sub]
+          );
+          await client.query('DELETE FROM mapishi_kipengele WHERE mapishi_id = $1', [prior.id]);
+          id = prior.id;
+        } else {
+          const ins = await client.query(
+            `INSERT INTO mapishi (ladha, ukubwa, dakika_kadirio, mapamba_variant, mapishi_ibaba, created_by)
+             VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+            [ladha, ukubwa, input.dakika_kadirio || 90, input.mapamba_variant || 'own_recipe',
+             input.mapishi_ibaba || null, ctx.user.sub]
+          );
+          id = ins.rows[0].id;
+        }
+
+        for (const l of lines) {
+          await client.query(
+            `INSERT INTO mapishi_kipengele
+               (mapishi_id, malighafi_id, kiasi_cha_chini, kiasi_cha_juu, sehemu)
+             VALUES ($1, $2, $3, $4, $5)`,
+            [id, l.malighafi_id, l.kiasi_cha_chini, l.kiasi_cha_juu, l.sehemu]
+          );
+        }
+        await client.query('COMMIT');
+        return (await client.query('SELECT * FROM mapishi WHERE id = $1', [id])).rows[0];
+      } catch (err) {
+        await client.query('ROLLBACK');
+        throw err;
+      } finally {
+        client.release();
+      }
+    },
+
+    hariri_mapishi: async (_, { id, input }, ctx) => {
+      requireCan(ctx.user, 'recipe.manage');
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const cur = (await client.query('SELECT * FROM mapishi WHERE id = $1 FOR UPDATE', [id])).rows[0];
+        if (!cur) throw new GraphQLError('Mapishi halipo.', { extensions: { code: 'NOT_FOUND' } });
+        const lines = await normaliseIngredients(client, input.viambato);
+        const clash = (
+          await client.query('SELECT id FROM mapishi WHERE ladha = $1 AND ukubwa = $2 AND id <> $3',
+            [String(input.ladha || '').trim(), String(input.ukubwa || '').trim(), id])
+        ).rows[0];
+        if (clash) {
+          throw new GraphQLError('Mapishi mwingine wenye jina na ukubwa huo upo.', {
+            extensions: { code: 'ALREADY_EXISTS', existing_id: clash.id },
+          });
+        }
+        await client.query(
+          `UPDATE mapishi SET ladha = $2, ukubwa = $3, dakika_kadirio = $4,
+                              mapamba_variant = $5, mapishi_ibaba = $6
+            WHERE id = $1`,
+          [id, String(input.ladha || '').trim(), String(input.ukubwa || '').trim(),
+           input.dakika_kadirio || 90, input.mapamba_variant || 'own_recipe',
+           input.mapishi_ibaba || null]
+        );
+        await client.query('DELETE FROM mapishi_kipengele WHERE mapishi_id = $1', [id]);
+        for (const l of lines) {
+          await client.query(
+            `INSERT INTO mapishi_kipengele
+               (mapishi_id, malighafi_id, kiasi_cha_chini, kiasi_cha_juu, sehemu)
+             VALUES ($1, $2, $3, $4, $5)`,
+            [id, l.malighafi_id, l.kiasi_cha_chini, l.kiasi_cha_juu, l.sehemu]
+          );
+        }
+        await client.query('COMMIT');
+        return (await client.query('SELECT * FROM mapishi WHERE id = $1', [id])).rows[0];
+      } catch (err) {
+        await client.query('ROLLBACK');
+        throw err;
+      } finally {
+        client.release();
+      }
+    },
+
+    /**
+     * Soft delete, not DELETE. agizo_maalum.mapishi_id has no ON DELETE CASCADE
+     * and past orders must keep pointing at the recipe they were baked from.
+     */
+    futa_mapishi: async (_, { id }, ctx) => {
+      requireCan(ctx.user, 'recipe.manage');
+      const { rows } = await pool.query(
+        'UPDATE mapishi SET active = false WHERE id = $1 RETURNING id', [id]
+      );
+      if (!rows[0]) throw new GraphQLError('Mapishi halipo.', { extensions: { code: 'NOT_FOUND' } });
+      return true;
+    },
+
+    unda_kategoria: async (_, { jina }, ctx) => {
+      requireCan(ctx.user, 'category.manage');
+      const name = String(jina || '').trim();
+      if (!name) throw new GraphQLError('Jina la kategoria linahitajika.', { extensions: { code: 'BAD_REQUEST' } });
+      const dupe = (await pool.query('SELECT id FROM kategoria WHERE LOWER(jina) = LOWER($1)', [name])).rows[0];
+      if (dupe) {
+        throw new GraphQLError('Kategoria hiyo tayari ipo.', { extensions: { code: 'ALREADY_EXISTS', existing_id: dupe.id } });
+      }
+      const { rows } = await pool.query('INSERT INTO kategoria (jina) VALUES ($1) RETURNING *', [name]);
+      return rows[0];
+    },
+
+    hariri_kategoria: async (_, { id, jina }, ctx) => {
+      requireCan(ctx.user, 'category.manage');
+      const name = String(jina || '').trim();
+      if (!name) throw new GraphQLError('Jina la kategoria linahitajika.', { extensions: { code: 'BAD_REQUEST' } });
+      const clash = (
+        await pool.query('SELECT id FROM kategoria WHERE LOWER(jina) = LOWER($1) AND id <> $2', [name, id])
+      ).rows[0];
+      if (clash) {
+        throw new GraphQLError('Kategoria nyingine yenye jina hilo ipo.', { extensions: { code: 'ALREADY_EXISTS' } });
+      }
+      const { rows } = await pool.query('UPDATE kategoria SET jina = $2 WHERE id = $1 RETURNING *', [id, name]);
+      if (!rows[0]) throw new GraphQLError('Kategoria haipo.', { extensions: { code: 'NOT_FOUND' } });
+      return rows[0];
+    },
+
+    /**
+     * Retire a category rather than deleting the row: bidhaa.kategoria_id has
+     * no ON DELETE, and past sales should keep resolving their category.
+     * Refused while any product still points at it, which turns "delete" into
+     * an explicit reassign-then-retire step instead of orphaning products.
+     */
+    futa_kategoria: async (_, { id }, ctx) => {
+      requireCan(ctx.user, 'category.manage');
+      const used = (
+        await pool.query('SELECT count(*)::int AS n FROM bidhaa WHERE kategoria_id = $1 AND active', [id])
+      ).rows[0].n;
+      if (used > 0) {
+        throw new GraphQLError(
+          `Kategoria ina bidhaa ${used} zilizo nazo. Hamunishene kwanza.`,
+          { extensions: { code: 'CATEGORY_IN_USE', bidhaa_count: used } }
+        );
+      }
+      const { rows } = await pool.query(
+        'UPDATE kategoria SET active = false WHERE id = $1 RETURNING id', [id]
+      );
+      if (!rows[0]) throw new GraphQLError('Kategoria haipo.', { extensions: { code: 'NOT_FOUND' } });
+      return true;
+    },
+
+    /** Bulk action: point many products at one category in a single call. */    panga_kategoria: async (_, { bidhaa_ids, kategoria_id }, ctx) => {
+      requireCan(ctx.user, 'category.manage');
+      const ids = (bidhaa_ids || []).map(Number).filter(Number.isInteger);
+      if (!ids.length) {
+        throw new GraphQLError('Chagua bidhaa angalau moja.', { extensions: { code: 'BAD_REQUEST' } });
+      }
+      const kat = (await pool.query('SELECT id FROM kategoria WHERE id = $1 AND active', [kategoria_id])).rows[0];
+      if (!kat) throw new GraphQLError('Kategoria haipo.', { extensions: { code: 'NOT_FOUND' } });
+      const { rowCount } = await pool.query(
+        'UPDATE bidhaa SET kategoria_id = $1 WHERE id = ANY($2::int[])', [kategoria_id, ids]
+      );
+      return rowCount;
+    },
+
+    tumia_ombi: async (_, { kwenda_kwa, ujumbe }, ctx) => {
+      requireCan(ctx.user, 'ombi.tuma');
+      const msg = String(ujumbe || '').trim();
+      if (!msg) throw new GraphQLError('Andika ujumbe.', { extensions: { code: 'BAD_REQUEST' } });
+      if (String(kwenda_kwa) === String(ctx.user.sub)) {
+        throw new GraphQLError('Huwezi kujiombia mwenyewe.', { extensions: { code: 'BAD_REQUEST' } });
+      }
+      const to = (
+        await pool.query('SELECT id FROM mtumiaji WHERE id = $1 AND active', [kwenda_kwa])
+      ).rows[0];
+      if (!to) throw new GraphQLError('Mfanyakaji hakupatikani.', { extensions: { code: 'NOT_FOUND' } });
+      const { rows } = await pool.query(
+        'INSERT INTO ombi (kutoka_kwa, kwenda_kwa, ujumbe) VALUES ($1, $2, $3) RETURNING *',
+        [ctx.user.sub, kwenda_kwa, msg]
+      );
+      return rows[0];
+    },
+
+    /**
+     * Only the person the request was addressed to may close it. The owner is
+     * allowed too, otherwise a request sent to a staff member who then left
+     * would sit open forever with nobody able to clear it.
+     */
+    fungua_ombi: async (_, { id, jibu }, ctx) => {
+      requireCan(ctx.user, 'ombi.fungua');
+      const cur = (await pool.query('SELECT * FROM ombi WHERE id = $1', [id])).rows[0];
+      if (!cur) throw new GraphQLError('Ombi halipo.', { extensions: { code: 'NOT_FOUND' } });
+      const isRecipient = String(cur.kwenda_kwa) === String(ctx.user.sub);
+      if (!isRecipient && ctx.user.jukumu !== ROLE_OWNER) {
+        throw new GraphQLError('Ombi huu ni wa mtu mwingine.', { extensions: { code: 'FORBIDDEN' } });
+      }
+      if (cur.hali === 'imefanyika') {
+        throw new GraphQLError('Ombi tayari umefunguliwa.', { extensions: { code: 'ALREADY_CLOSED' } });
+      }
+      const { rows } = await pool.query(
+        `UPDATE ombi SET hali = 'imefanyika', jibu = $2, tarehe_ya_kufunguliwa = now()
+          WHERE id = $1 RETURNING *`,
+        [id, jibu ? String(jibu).trim() : null]
+      );
+      return rows[0];
+    },
+
 
     marekebisho_hisa: async (_, { input }, ctx) => {
       const u = ctx.user;

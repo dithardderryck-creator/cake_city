@@ -12,6 +12,13 @@ export const ORDER_KWAJIKONI = gql`
   query OrderKwajikoni {
     order_kwajikoni {
       id ladha design ukubwa tarehe_ya_kuchukua hali muda_hitajika
+      mapishi {
+        id ladha ukubwa dakika_kadirio
+        viambato {
+          id sehemu kiasi_cha_chini kiasi_cha_juu
+          malighafi { id jina unit }
+        }
+      }
     }
   }
 `
@@ -144,5 +151,51 @@ export const KUMBUKUMBU_KITENDO = gql`
       id tarehe meza kitendo node_id
       data_ya_kabla data_ya_baada
     }
+  }
+`
+// ---------------------------------------------------------------------------
+// Recipes, ingredient usage verification, categories, and staff requests.
+// ---------------------------------------------------------------------------
+
+export const MAPISHI = gql`
+  query Mapishi {
+    mapishi {
+      id ladha ukubwa dakika_kadirio mapamba_variant
+      mapishi_ibaba { id ladha ukubwa }
+      viambato {
+        id sehemu kiasi_cha_chini kiasi_cha_juu
+        malighafi { id jina unit kiasi_kilichopo }
+      }
+    }
+  }
+`
+
+/** The verification queue, with enough context to sanity-check each number. */
+export const MATUMIZI_KUSUBIRI = gql`
+  query MatumiziKusubiri {
+    kumbukumbu_matumizi_kusubiri {
+      id kiasi kumbukumbu hali tarehe
+      agizo_ladha agizo_ukubwa mapishi_ladha mapishi_ukubwa
+      malighafi { id jina unit }
+      mpishi { id jina }
+    }
+  }
+`
+
+export const KATEGORIA = gql`
+  query Kategoria {
+    kategoria {
+      id jina
+      bidhaa { id jina familia ukubwa bei active }
+    }
+  }
+`
+
+/** Both directions, so you can see what you sent as well as what came in. */
+export const OMBI = gql`
+  query Ombi {
+    ombi { id ujumbe jibu hali created_at tarehe_ya_kufunguliwa
+           kutoka_kwa { id jina jukumu }
+           kwenda_kwa { id jina jukumu } }
   }
 `

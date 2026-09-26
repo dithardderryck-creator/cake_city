@@ -100,6 +100,58 @@ module.exports = gql`
     bei: Float!
     aina: String
     active: Boolean
+    "Flavour family, e.g. 'Keki ya Karoti'. Split out of the free-text name so sizes group together."
+    familia: String
+    "Size within the family, e.g. 'dira 18' or 'pcs'. Each size is its own sellable thing with its own price and recipe."
+    ukubwa: String
+    kategoria: Kategoria
+  }
+
+  type Kategoria {
+    id: ID!
+    jina: String!
+    active: Boolean
+    bidhaa: [Bidhaa!]!
+  }
+
+  "A predefined ingredient list for a CUSTOM cake order. Shop products do not use these."
+  type Mapishi {
+    id: ID!
+    ladha: String!
+    ukubwa: String!
+    dakika_kadirio: Int!
+    active: Boolean
+    "own_recipe = its own weighed amounts. fraction_of = a portion of another cake (a slice), so it inherits rather than repeating."
+    mapamba_variant: String!
+    mapishi_ibaba: Mapishi
+    viambato: [MapishiKipengele!]!
+    created_at: DateTime
+  }
+
+  type MapishiKipengele {
+    id: ID!
+    malighafi: Malighafi!
+    kiasi_cha_chini: Float!
+    kiasi_cha_juu: Float!
+    "Which part of the cake: mfuatano (base), krimu (frosting), ... A cake can use the same ingredient twice."
+    sehemu: String!
+  }
+
+  "A request from one staff member to another. Distinct from Ukumbusho, which is computer-generated."
+  type Ombi {
+    id: ID!
+    kutoka_kwa: Mtumiaji!
+    kwenda_kwa: Mtumiaji!
+    ujumbe: String!
+    hali: HaliOmbi!
+    jibu: String
+    tarehe_ya_kufunguliwa: DateTime
+    created_at: DateTime!
+  }
+
+  enum HaliOmbi {
+    fungua
+    imefanyika
   }
 
   type Mteja {
@@ -116,6 +168,10 @@ module.exports = gql`
     ladha: String!
     design: String
     ukubwa: String
+    "Optional: pick a recipe from the book so the kitchen's tap sheet starts prefilled. Omit it and the order is treated as off-book/custom."
+    mapishi_id: ID
+    "Set when the cake came from the recipe book. NULL means a custom/off-book order, which is the special-order flag."
+    mapishi: Mapishi
     tarehe_ya_kuchukua: Date!
       bei_jumla: Float
       malipo_ya_awali: Float
@@ -161,9 +217,28 @@ module.exports = gql`
     id: ID!
     agizo: AgizoMaalum
     malighafi: Malighafi!
+    "What the chef logged. Possibly mid-range. Never moves stock on its own."
     kiasi: Float!
     mpishi: Mtumiaji
     tarehe: DateTime!
+    "inakadiriwa = the chef's estimate, awaiting confirmation. imethibitishwa = inventory confirmed it and stock moved."
+    hali: HaliUthibitishoMatumizi!
+    "The real number, filled in by inventory at verification. Null until then."
+    kiasi_halisi: Float
+    imethibitishwa_na: Mtumiaji
+    tarehe_ya_uthibitisho: DateTime
+    "What this usage was for, when there is no order to say it. e.g. '20 mandazi'."
+    kumbukumbu: String
+    "Context for the verification queue: which order and which recipe this estimate belongs to. Null for a walk-in batch."
+    agizo_ladha: String
+    agizo_ukubwa: String
+    mapishi_ladha: String
+    mapishi_ukubwa: String
+  }
+
+  enum HaliUthibitishoMatumizi {
+    inakadiriwa
+    imethibitishwa
   }
 
   type Malighafi {
@@ -235,6 +310,12 @@ module.exports = gql`
     utabiri_hisa(kiasi_chini_ya_siku: Int): [UtabiriHisa!]!
     tikiti(tarehe: Date, hali: TikitiHali): [Tikiti!]!
     kumbukumbu_kitendo(meza: String, node_id: ID, kikomo: Int): [KumbukumbuKitendo!]!
+    mapishi(active: Boolean): [Mapishi!]!
+    "Estimated usage awaiting inventory's confirmation. Stock has not moved for these yet."
+    kumbukumbu_matumizi_kusubiri: [KumbukumbuMatumizi!]!
+    kategoria(active: Boolean): [Kategoria!]!
+    "fungua: only open requests. Omit for everything."
+    ombi(fungua: Boolean): [Ombi!]!
   }
 
   type Dashboard {
@@ -263,6 +344,10 @@ module.exports = gql`
     jina: String!
     bei: Float!
     aina: String
+    "Optional on create: derived from jina if omitted. Supply explicitly to set a family that does not match the name."
+    familia: String
+    ukubwa: String
+    kategoria_id: ID
   }
 
   input MalighafiInput {
@@ -289,6 +374,8 @@ module.exports = gql`
       ladha: String!
       design: String
       ukubwa: String
+      "Optional: pick a recipe from the book so the kitchen's tap sheet starts prefilled. Omit it and the order is treated as off-book/custom."
+      mapishi_id: ID
       tarehe_ya_kuchukua: Date!
       bei_jumla: Float!
       malipo_ya_awali: Float!
@@ -301,6 +388,34 @@ module.exports = gql`
     agizo_id: ID!
     malighafi_id: ID!
     kiasi: Float!
+  }
+
+  input MatumiziKipengeleInput {
+    malighafi_id: ID!
+    kiasi: Float!
+  }
+
+  "One tap-submit of many ingredients. agizo_id is OPTIONAL: regular shop production has no order, so kumbukumbu (e.g. '20 mandazi') is what explains the entry."
+  input MatumiziKundiInput {
+    agizo_id: ID
+    kumbukumbu: String
+    vitu: [MatumiziKipengeleInput!]!
+  }
+
+  input MapishiKipengeleInput {
+    malighafi_id: ID!
+    kiasi_cha_chini: Float!
+    kiasi_cha_juu: Float!
+    sehemu: String
+  }
+
+  input MapishiInput {
+    ladha: String!
+    ukubwa: String!
+    dakika_kadirio: Int
+    mapamba_variant: String
+    mapishi_ibaba: ID
+    viambato: [MapishiKipengeleInput!]!
   }
 
   input MarekebishoInput {
@@ -331,6 +446,27 @@ module.exports = gql`
     chukua_agizo(id: ID!): AgizoMaalum!
     futa_agizo(id: ID!): Boolean!
     log_matumizi(input: MatumiziInput!): KumbukumbuMatumizi!
+    "The chef's tap logging: many ingredients in one submit. Stock does NOT move here — this records an estimate."
+    log_matumizi_kundi(input: MatumiziKundiInput!): [KumbukumbuMatumizi!]!
+    "Inventory confirms the real number. This is the point stock actually moves."
+    thibitisha_matumizi(id: ID!, kiasi_halisi: Float!): KumbukumbuMatumizi!
+
+    unda_mapishi(input: MapishiInput!): Mapishi!
+    hariri_mapishi(id: ID!, input: MapishiInput!): Mapishi!
+    futa_mapishi(id: ID!): Boolean!
+
+    unda_kategoria(jina: String!): Kategoria!
+    hariri_kategoria(id: ID!, jina: String!): Kategoria!
+    "Retire a category. Refused while products still point at it, so a category can never vanish out from under them."
+    futa_kategoria(id: ID!): Boolean!
+    "Bulk action: move many products into one category at once."
+    panga_kategoria(bidhaa_ids: [ID!]!, kategoria_id: ID!): Int!
+
+    "Ask another member of staff for something. Does not move stock."
+    tumia_ombi(kwenda_kwa: ID!, ujumbe: String!): Ombi!
+    "Clear a request. Only the person it was addressed to may do this."
+    fungua_ombi(id: ID!, jibu: String): Ombi!
+
     marekebisho_hisa(input: MarekebishoInput!): MarekebishoHisa!
     ongeza_mfanyakazi(jina: String!, jukumu: Jukumu!, pin: String!): Mtumiaji!
     hariri_mfanyakazi(id: ID!, input: MtumiajiUpdateInput!): Mtumiaji!

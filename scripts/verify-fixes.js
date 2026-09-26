@@ -152,14 +152,27 @@ async function main() {
   check('C2 deposit above total rejected', codeOf(depositTooBig) === 'BAD_REQUEST', `${codeOf(depositTooBig)} ${msgOf(depositTooBig)}`);
 
   // ---- C1: DB-level CHECK is a real backstop ---------------------------
+  // malighafi is deliberately NOT in this list and has no CHECK on stock.
+  // Stock may legitimately go negative: the chef's log is an estimate, and
+  // verification records the real number even when it exceeds what we had.
+  // The negative balance is the signal that we were under-stocked.
   const constraints = await sql(
     `SELECT conname FROM pg_constraint WHERE contype='c'
-      AND conrelid::regclass::text IN ('mauzo_bidhaa','kumbukumbu_matumizi','marekebisho_hisa','agizo_maalum','malighafi')`
+      AND conrelid::regclass::text IN ('mauzo_bidhaa','kumbukumbu_matumizi','marekebisho_hisa','agizo_maalum')`
   );
   const names = constraints.map((c) => c.conname);
-  check('C1 CHECK constraints installed', names.length >= 5, names.join(', '));
+  check('C1 CHECK constraints installed', names.length >= 4, names.join(', '));
+  const stockChecks = await sql(
+    `SELECT conname FROM pg_constraint WHERE contype='c' AND conrelid='malighafi'::regclass`
+  );
+  check('C1 stock has no floor CHECK (negative is a valid signal)', stockChecks.length === 0, stockChecks.map((c) => c.conname).join(', '));
 
-  // ---- C3: usage log cannot drive stock negative ----------------------
+  // ---- C3: a chef's log is an estimate and must not move stock ---------
+  // This replaced an older rule that refused usage beyond available stock.
+  // The chef logs what they think they used, from the bench, mid-batch.
+  // Refusing there just taught people to under-report. Stock moves only when
+  // inventory verifies, and then it records the real number even if that
+  // drives the balance negative.
   const ing = await sql(
     `INSERT INTO malighafi (jina,kiasi_kilichopo,kiwango_cha_chini,unit) VALUES ('ZZ-VERIFY',5,10,'kg') RETURNING id`
   );
@@ -176,14 +189,36 @@ async function main() {
     `mutation{log_matumizi(input:{agizo_id:${usageOrderId},malighafi_id:${ingId},kiasi:999}){id}}`,
     ownerToken
   );
-  check('C3 usage beyond available stock refused', codeOf(over) === 'INSUFFICIENT_STOCK', `${codeOf(over)} ${msgOf(over)}`);
+  check('C3 logging beyond stock is allowed (it is only an estimate)', !over.errors, msgOf(over));
   const negUsage = await gql(
     `mutation{log_matumizi(input:{agizo_id:${usageOrderId},malighafi_id:${ingId},kiasi:-1}){id}}`,
     ownerToken
   );
   check('C1 negative usage quantity rejected', codeOf(negUsage) === 'BAD_REQUEST', `${codeOf(negUsage)} ${msgOf(negUsage)}`);
   const after = await sql('SELECT kiasi_kilichopo FROM malighafi WHERE id=$1', [ingId]);
-  check('C1/C3 stock never went negative', Number(after[0].kiasi_kilichopo) >= 0, after[0].kiasi_kilichopo);
+  check('C3 logging did not move stock', Number(after[0].kiasi_kilichopo) === 5, after[0].kiasi_kilichopo);
+
+  // ---- C3b: verification is what moves stock, and may go negative ------
+  const loggedId = over?.data?.log_matumizi?.id;
+  if (loggedId) {
+    const verified = await gql(
+      `mutation{thibitisha_matumizi(id:${loggedId},kiasi_halisi:8){id hali kiasi_halisi}}`,
+      ownerToken
+    );
+    check('C3b verification accepted and marks the row verified',
+      verified?.data?.thibitisha_matumizi?.hali === 'imethibitishwa', msgOf(verified));
+    const afterVerify = await sql('SELECT kiasi_kilichopo FROM malighafi WHERE id=$1', [ingId]);
+    check('C3b verification moved stock by the real amount (5 - 8 = -3)',
+      Number(afterVerify[0].kiasi_kilichopo) === -3, afterVerify[0].kiasi_kilichopo);
+    const twice = await gql(
+      `mutation{thibitisha_matumizi(id:${loggedId},kiasi_halisi:8){id}}`,
+      ownerToken
+    );
+    check('C3b verifying twice is refused (no double decrement)', !!twice.errors, msgOf(twice));
+    const afterTwice = await sql('SELECT kiasi_kilichopo FROM malighafi WHERE id=$1', [ingId]);
+    check('C3b stock unchanged by the refused second verification',
+      Number(afterTwice[0].kiasi_kilichopo) === -3, afterTwice[0].kiasi_kilichopo);
+  }
 
   const negWaste = await gql(
     `mutation{marekebisho_hisa(input:{malighafi_id:${ingId},aina:waste,kiasi:-3,sababu:"v"}){id}}`,

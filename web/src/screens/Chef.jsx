@@ -1,10 +1,9 @@
 import { useState } from 'react'
 import { useQuery, useMutation } from '@apollo/client'
-import { ORDER_KWAJIKONI, HISA, UKUMBUSHO } from '../graphql/queries'
-import { BADGE_HALI_ORDER, LOG_MATUMIZI } from '../graphql/mutations'
+import { ORDER_KWAJIKONI, HISA, MALIGHAFI, UKUMBUSHO } from '../graphql/queries'
+import { BADGE_HALI_ORDER, LOG_MATUMIZI_KUNDI } from '../graphql/mutations'
 import { Card, CardFull } from '../ui/Card'
 import { Btn } from '../ui/Btn'
-import { Select } from '../ui/Select'
 import { StatusPill } from '../ui/charts'
 import { Modal } from '../ui/Modal'
 import { FieldSquare } from '../ui/Field'
@@ -49,15 +48,21 @@ function fmtPrep(min) {
 export default function Chef() {
   const { data, loading, refetch } = useQuery(ORDER_KWAJIKONI)
   const { data: stockData } = useQuery(HISA)
+  const { data: ingData } = useQuery(MALIGHAFI)
   const { data: remindData } = useQuery(UKUMBUSHO, { pollInterval: 30000 })
   const [badgeHali] = useMutation(BADGE_HALI_ORDER, { refetchQueries: [{ query: ORDER_KWAJIKONI }, { query: UKUMBUSHO }] })
-  const [logMatumizi] = useMutation(LOG_MATUMIZI)
+  const [logKundi] = useMutation(LOG_MATUMIZI_KUNDI, { refetchQueries: [{ query: MALIGHAFI }, { query: HISA }] })
+  // null = closed. An object with order:null is a STANDALONE batch: regular shop
+  // production like "20 mandazi" that has no order behind it.
   const [logOpen, setLogOpen] = useState(null)
-  const [logForm, setLogForm] = useState({ malighafi_id: '', kiasi: '' })
+  // { [malighafi_id]: kiasi } — the running tally of what has been tapped
+  const [taps, setTaps] = useState({})
+  const [logNote, setLogNote] = useState('')
   const [logBusy, setLogBusy] = useState(false)
   const [logMsg, setLogMsg] = useState('')
 
   const orders = data?.order_kwajikoni || []
+  const ingredients = ingData?.malighafi || []
   const lowStock = stockData?.hisa?.lowStock || []
   const startNow = (remindData?.ukumbusho || []).filter((r) => r.aina === 'anza_kutengeneza')
 
@@ -65,26 +70,71 @@ export default function Chef() {
     await badgeHali({ variables: { id, hali } })
   }
 
+  /** Open the sheet, optionally seeded from an order's recipe. */
+  const openLog = (order) => {
+    const seed = {}
+    // Only a CUSTOM cake order that came from the recipe book gets a prefill.
+    // Everything else — regular products, and off-book custom orders — starts
+    // empty, because a guessed ingredient list is worse than a blank sheet.
+    for (const line of order?.mapishi?.viambato || []) {
+      const mid = String(line.malighafi.id)
+      // Start at the midpoint of the suggested range; the chef taps to adjust.
+      seed[mid] = Math.round(((line.kiasi_cha_chini + line.kiasi_cha_juu) / 2) * 100) / 100
+    }
+    setTaps(seed)
+    setLogNote('')
+    setLogMsg('')
+    setLogOpen(order || { order: null })
+  }
+
+  const closeLog = () => { setLogOpen(null); setTaps({}); setLogNote(''); setLogMsg('') }
+
+  /** Tap once to add a sensible step, again to add more, tap the pill to remove. */
+  const step = (unit) => (unit === 'pcs' ? 1 : 0.25)
+  const tapAdd = (ing) => {
+    const id = String(ing.id)
+    setTaps((t) => ({ ...t, [id]: (t[id] || 0) + step(ing.unit) }))
+  }
+  const tapRemove = (id) => {
+    const key = String(id)
+    setTaps((t) => {
+      const next = { ...t }
+      delete next[key]
+      return next
+    })
+  }
+
+  const tapTotal = Object.values(taps).reduce((a, b) => a + b, 0)
+  const tapCount = Object.keys(taps).length
+  // Without an order there is nothing to explain the entry, so the note is
+  // required. The server enforces this too; catching it here saves a round trip.
+  const noteRequired = !logOpen?.order
+
   const submitLog = async (e) => {
     e.preventDefault()
-    if (!logForm.malighafi_id || !logForm.kiasi) return
+    if (!tapCount) { setLogMsg('Gonga kitu chochote kwanza.'); return }
+    if (noteRequired && !logNote.trim()) { setLogMsg('Andika maelezo ya kile kundi.'); return }
     setLogBusy(true)
     setLogMsg('')
     try {
-      await logMatumizi({
+      await logKundi({
         variables: {
           input: {
-            agizo_id: String(logOpen.id),
-            malighafi_id: String(logForm.malighafi_id),
-            kiasi: Number(logForm.kiasi),
+            agizo_id: logOpen?.order ? String(logOpen.order.id) : null,
+            kumbukumbu: logNote.trim() || null,
+            vitu: Object.entries(taps).map(([malighafi_id, kiasi]) => ({
+              malighafi_id: malighafi_id,
+              kiasi: Number(kiasi),
+            })),
           },
         },
       })
-      setLogMsg('Imerekodwa. Stock imeshapunguzwa.')
-      setLogForm({ malighafi_id: '', kiasi: '' })
+      setLogMsg('Imerekodwa. Hesa zitasubiri kuthibitishwa na hesabu.')
+      setTaps({})
+      setLogNote('')
       refetch()
     } catch (err) {
-      setLogMsg(err?.message?.includes('INSUFFICIENT_STOCK') ? 'Kiasi hakipatikani stock' : 'Hitilafu imetokea')
+      setLogMsg(err?.message || 'Hitilafu imetokea')
     } finally {
       setLogBusy(false)
     }
@@ -106,9 +156,15 @@ export default function Chef() {
               <p className="text-[11px] text-espresso-muted">Maagizo {activeCount} yanayoendelea</p>
             </div>
           </div>
-          <span className="inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-[10px] font-semibold uppercase tracking-wider bg-sage/[0.1] text-sage-deep">
-            <Fire weight="light" className="w-3.5 h-3.5" /> Jikoni
-          </span>
+            <div className="flex items-center gap-2">
+              {/* Regular production has no order, so it needs its own way in. */}
+              <Btn variant="ghost" size="sm" icon={Hammer} onClick={() => openLog(null)}>
+                Kundi la Uzalishaji
+              </Btn>
+              <span className="inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-[10px] font-semibold uppercase tracking-wider bg-sage/[0.1] text-sage-deep">
+                <Fire weight="light" className="w-3.5 h-3.5" /> Jikoni
+              </span>
+            </div>
         </div>
 
         {startNow.length > 0 && (
@@ -174,8 +230,8 @@ export default function Chef() {
                       <Btn variant="accent" size="sm" icon={CheckCircle} onClick={() => handleStatus(o.id, 'ready')}>
                         Tayari
                       </Btn>
-                      <Btn variant="ghost" size="sm" onClick={() => { setLogOpen(o); setLogMsg('') }}>
-                        Log Matumizi
+                      <Btn variant="ghost" size="sm" onClick={() => openLog(o)}>
+                        {o.mapishi ? 'Rekodi Matumizi' : 'Weka Malighafi'}
                       </Btn>
                     </>
                   )}
@@ -225,35 +281,158 @@ export default function Chef() {
         </CardFull>
       </div>
 
-      {/* Ingredient log modal */}
-      <Modal open={!!logOpen} onClose={() => setLogOpen(null)} title="Log Matumizi ya Malighafi">
+      {/* Ingredient tap sheet. Prefilled from a custom order's recipe, or blank
+          for a regular batch. Nothing here moves stock. */}
+      <Modal
+        open={!!logOpen}
+        onClose={closeLog}
+        title={logOpen?.order ? 'Rekodi Matumizi' : 'Rekodi Kundi la Uzalishaji'}
+      >
         {logOpen && (
           <form onSubmit={submitLog} className="flex flex-col gap-4">
-            <p className="text-xs text-espresso-muted">Agizo: <span className="font-semibold text-espresso">{logOpen.ladha} — {logOpen.ukubwa || ''}</span></p>
-            <Select
-              label="Malighafi"
-              value={logForm.malighafi_id}
-              onChange={(e) => setLogForm((f) => ({ ...f, malighafi_id: e.target.value }))}
-            >
-              <option value="">— Chagua —</option>
-              {(stockData?.hisa?.items || []).map((i) => (
-                <option key={i.id} value={i.id}>{i.jina} ({i.kiasi_kilichopo} {i.unit} iliyopo)</option>
-              ))}
-            </Select>
+            <div className="rounded-2xl bg-espresso/[0.03] ring-1 ring-espresso/[0.06] px-4 py-3">
+              {logOpen.order ? (
+                <>
+                  <p className="text-[11px] uppercase tracking-wider text-espresso-muted">Agizo</p>
+                  <p className="font-semibold text-espresso">
+                    {logOpen.order.ladha} — {logOpen.order.ukubwa || ''}
+                  </p>
+                  {logOpen.order.mapishi ? (
+                    <p className="text-xs text-sage-deep mt-1">
+                      Mapishi: {logOpen.order.mapishi.ladha} ({logOpen.order.mapishi.ukubwa})
+                    </p>
+                  ) : (
+                    <p className="text-xs text-espresso-muted mt-1">
+                      Hakuna mapishi — andika kile unachotumia.
+                    </p>
+                  )}
+                </>
+              ) : (
+                <>
+                  <p className="text-[11px] uppercase tracking-wider text-espresso-muted">Uzalishaji wa kawaida</p>
+                  <p className="font-semibold text-espresso">Hakuna agizo — fungua kile unachotengeneza</p>
+                </>
+              )}
+            </div>
+
+            {logOpen.order?.mapishi?.viambato?.length > 0 && (
+              <p className="text-xs text-espresso-muted -mt-1">
+                Vimewekwa wastani wa mapishi. Gonga ili kubadilisha.
+              </p>
+            )}
+
+            {/* Tap targets. Big on purpose: this is used with wet or floured hands. */}
+            <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+              {ingredients.map((ing) => {
+                const id = String(ing.id)
+                const amt = taps[id] || 0
+                return (
+                  <button
+                    key={ing.id}
+                    type="button"
+                    onClick={() => (amt ? tapRemove(ing.id) : tapAdd(ing))}
+                    aria-pressed={!!amt}
+                    className={`relative text-left rounded-2xl px-3 py-3 min-h-[64px] transition-all duration-200 ${
+                      amt
+                        ? 'bg-sage text-white shadow-sm'
+                        : 'bg-white ring-1 ring-espresso/[0.08] hover:ring-espresso/20 active:scale-[0.97]'
+                    }`}
+                  >
+                    <span className={`block text-sm font-semibold ${amt ? 'text-white' : 'text-espresso'}`}>
+                      {ing.jina}
+                    </span>
+                    {amt ? (
+                      <span className="block text-xs text-white/80 mt-0.5">
+                        {amt} {ing.unit} · ondoa
+                      </span>
+                    ) : (
+                      <span className="block text-[11px] text-espresso-muted mt-0.5">
+                        {(ing.kiasi_kilichopo ?? 0)} {ing.unit} zilizopo
+                      </span>
+                    )}
+                  </button>
+                )
+              })}
+            </div>
+
+            {/* Running tally, tappable to clear a line. */}
+            {tapCount > 0 && (
+              <div className="flex flex-col gap-1.5 rounded-2xl bg-espresso/[0.03] p-3">
+                {Object.entries(taps).map(([id, amt]) => {
+                  const ing = ingredients.find((x) => String(x.id) === id)
+                  return (
+                    <div key={id} className="flex items-center justify-between gap-2">
+                      <span className="text-xs text-espresso">
+                        {ing?.jina || `#${id}`} — {ing?.unit}
+                      </span>
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() => tapRemove(id)}
+                          className="w-6 h-6 rounded-full bg-white ring-1 ring-espresso/10 text-espresso-muted text-xs leading-none"
+                          aria-label={`Ondoa ${ing?.jina}`}
+                        >
+                          −
+                        </button>
+                        <input
+                          type="number"
+                          min="0"
+                          step="0.25"
+                          value={amt}
+                          onChange={(e) => setTaps((t) => ({ ...t, [id]: Number(e.target.value) }))}
+                          className="w-16 rounded-lg bg-white ring-1 ring-espresso/10 px-2 py-1 text-xs text-espresso text-right"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => tapAdd(ing || { id, unit: '' })}
+                          className="w-6 h-6 rounded-full bg-sage text-white text-xs leading-none"
+                          aria-label={`Ongeza ${ing?.jina}`}
+                        >
+                          +
+                        </button>
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+
             <FieldSquare
-              label="Kiasi"
-              type="number"
-              min="0.1"
-              step="0.1"
-              required
-              value={logForm.kiasi}
-              onChange={(e) => setLogForm((f) => ({ ...f, kiasi: e.target.value }))}
-              placeholder="mf. 2"
+              label={noteRequired ? 'Maelezo ya kundi *' : 'Maelezo (si lazima)'}
+              value={logNote}
+              onChange={(e) => setLogNote(e.target.value)}
+              placeholder={noteRequired ? 'mf. 20 mandazi' : 'mf. alikuwa mbaya kidogo'}
             />
-            {logMsg && <p className={`text-xs font-medium text-center ${logMsg.includes('Hitilafu') || logMsg.includes('hakipatikani') ? 'text-red-500' : 'text-sage'}`}>{logMsg}</p>}
-            <Btn type="submit" variant="accent" size="lg" iconRight={ArrowRight} disabled={logBusy} className="w-full">
-              {logBusy ? 'Inachapisha...' : 'Rekodi Matumizi'}
-            </Btn>
+
+            {logMsg && (
+              <p
+                className={`text-xs font-medium text-center ${
+                  logMsg.startsWith('Ime') ? 'text-sage' : 'text-red-500'
+                }`}
+              >
+                {logMsg}
+              </p>
+            )}
+
+            <div className="flex items-center gap-3">
+              <Btn
+                type="submit"
+                variant="accent"
+                size="lg"
+                iconRight={ArrowRight}
+                disabled={logBusy || !tapCount}
+                className="flex-1"
+              >
+                {logBusy ? 'Inachapisha...' : `Rekodi ${tapCount ? `(${tapCount})` : ''}`}
+              </Btn>
+              <Btn type="button" variant="ghost" size="lg" onClick={() => setTaps({})}>
+                Futa
+              </Btn>
+            </div>
+
+            <p className="text-[11px] text-espresso-muted text-center">
+              Kumbukumbu hii ni makadirio. Hesa zitapunguzwa na hesabu baada ya kuthibitishwa.
+            </p>
           </form>
         )}
       </Modal>

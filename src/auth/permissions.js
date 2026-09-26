@@ -20,11 +20,20 @@ const PERMISSIONS = {
     'order.cancel': true,
     'usage.create': true,
     'usage.read_all': true,
+    // Confirming the real number is what moves stock, so it is kept separate
+    // from usage.create (the chef's estimate) and from usage.read_all (viewing).
+    'usage.verify': true,
     'stock.read': true,
     'stock.adjust_restock': true,
     'stock.adjust_waste': true,
     'product.manage': true,
     'product.read': true,
+    // The inventory clerk knows real ingredient usage better than anyone, so
+    // they get recipe authoring alongside the owner.
+    'recipe.manage': true,
+    'category.manage': true,
+    'ombi.tuma': true,
+    'ombi.fungua': true,
     'staff.manage': true,
     'customer.manage': true,
     'report.access_dashboard': true,
@@ -38,6 +47,10 @@ const PERMISSIONS = {
     'stock.read': true,
     'product.read': true,
     'customer.manage': true,
+    // Cashiers can ask the kitchen for something, but cannot clear a request
+    // addressed to them unless they are the intended recipient — that check
+    // lives in the resolver, this only gates sending.
+    'ombi.tuma': true,
   },
   [ROLE_CHEF]: {
     'order.read_kitchen': true,
@@ -46,12 +59,19 @@ const PERMISSIONS = {
     'order.collect': true,
     'usage.create': true,
     'stock.read': true,
+    'ombi.tuma': true,
   },
   [ROLE_INVENTORY]: {
     'usage.read_all': true,
+    // Verifying usage is the inventory role's core job, so it belongs here.
+    'usage.verify': true,
     'stock.read': true,
     'stock.adjust_restock': true,
     'stock.adjust_waste': true,
+    'recipe.manage': true,
+    'category.manage': true,
+    'ombi.tuma': true,
+    'ombi.fungua': true,
   },
 };
 

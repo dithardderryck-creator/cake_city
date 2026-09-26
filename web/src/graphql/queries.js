@@ -16,7 +16,7 @@ export const ORDER_KWAJIKONI = gql`
         id ladha ukubwa dakika_kadirio
         viambato {
           id sehemu kiasi_cha_chini kiasi_cha_juu
-          malighafi { id jina unit }
+      malighafi { id jina unit kiasi_kilichopo }
         }
       }
     }
@@ -55,7 +55,7 @@ export const MAUZO_YA_LEO = gql`
 export const KUMBUKUMU_MATUMIZI = gql`
   query KumbukumbuMatumizi($agizoId: ID) {
     kumbukumbu_matumizi(agizo_id: $agizoId) {
-      id kiasi tarehe
+      id kiasi kiasi_halisi hali tarehe
       malighafi { id jina unit }
       mpishi { id jina }
       agizo { id ladha }

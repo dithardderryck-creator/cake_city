@@ -1,8 +1,8 @@
 import { useState } from 'react'
 import { useQuery, useMutation } from '@apollo/client'
 import { useAuth } from '../auth'
-import { MALIGHAFI, KUMBUKUMU_MATUMIZI, MAREKEBISHO_HISA, UTABIRI_HISA } from '../graphql/queries'
-import { MAREKEBISHO_HISA_MUT, ONGEZA_MALIGHAFI, HARIRI_MALIGHAFI } from '../graphql/mutations'
+import { MALIGHAFI, KUMBUKUMBU_MATUMIZI, KUMBUKUMU_MATUMIZI, MAREKEBISHO_HISA, UTABIRI_HISA, MATUMIZI_KUSUBIRI } from '../graphql/queries'
+import { MAREKEBISHO_HISA_MUT, ONGEZA_MALIGHAFI, HARIRI_MALIGHAFI, THIBITISHA_MATUMIZI } from '../graphql/mutations'
 import { Card, CardFull } from '../ui/Card'
 import { Btn } from '../ui/Btn'
 import { Badge } from '../ui/Badge'
@@ -295,27 +295,202 @@ function AddMalighafiModal({ open, onClose }) {
   )
 }
 
+function VerifyQueue() {
+  const { user } = useAuth()
+  const canVerify = ['owner', 'inventory'].includes(user?.jukumu)
+  const { data, loading, refetch } = useQuery(MATUMIZI_KUSUBIRI, {
+    skip: !canVerify,
+    pollInterval: 30000,
+  })
+  const [verify] = useMutation(THIBITISHA_MATUMIZI, {
+    refetchQueries: [{ query: MATUMIZI_KUSUBIRI }, { query: KUMBUKUMU_MATUMIZI }, { query: MALIGHAFI }],
+  })
+  // { [id]: kiasi halisi }. Seeded from the chef's estimate so accepting a
+  // number is one tap; typing a different one is the same number of taps.
+  const [draft, setDraft] = useState({})
+  const [busy, setBusy] = useState(null)
+  const [msg, setMsg] = useState('')
+
+  const queue = data?.kumbukumbu_matumizi_kusubiri || []
+  if (!canVerify || (loading && !queue.length)) return null
+
+  const confirm = async (row) => {
+    const val = draft[row.id] ?? row.kiasi
+    if (val === '' || val === undefined || Number(val) < 0) {
+      setMsg('Kiasi halisi lazima kiwe namba isiyo chini ya sifuri.');
+      return
+    }
+    setBusy(row.id)
+    setMsg('')
+    try {
+      await verify({ variables: { id: row.id, kiasi_halisi: Number(val) } })
+      setMsg('Imethibitishwa. Hesa imepunguzwa.')
+      refetch()
+    } catch (e) {
+      setMsg(e?.message || 'Imeshindwa. Jaribu tena.')
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  if (!queue.length) {
+    return (
+      <Card className="p-5 border-sage/25 bg-sage/[0.04]">
+        <div className="flex items-center gap-3">
+          <div className="w-9 h-9 rounded-full bg-sage/15 flex items-center justify-center shrink-0">
+            <Check weight="bold" className="w-4 h-4 text-sage-deep" />
+          </div>
+          <div>
+            <p className="text-sm font-semibold text-sage-deep">Hakuna matumizi ya kusubiri</p>
+            <p className="text-[11px] text-espresso-muted">Matumizi yote yame$thibitishwa. Hesa ziko sawa.</p>
+          </div>
+        </div>
+      </Card>
+    )
+  }
+
+  return (
+    <Card className="p-5 border-copper/30">
+      <div className="flex items-center justify-between mb-1 flex-wrap gap-2">
+        <h3 className="font-serif text-base font-semibold">
+          Matumizi ya kusubiri ({queue.length})
+        </h3>
+        <span className="text-[10px] font-semibold uppercase tracking-wider text-espresso-muted">
+          Hakusaidii hesa bado
+        </span>
+      </div>
+      <p className="text-[11px] text-espresso-muted mb-4">
+        Mpishi aliandika makadirio. Weka kiasi halisi — stock hupunguzwa hapa, si pale.
+      </p>
+
+      <div className="flex flex-col gap-2.5">
+        {queue.map((row) => {
+          const ing = row.malighafi
+          const estimate = row.kiasi
+          const typed = draft[row.id]
+          const actual = typed === undefined || typed === '' ? estimate : Number(typed)
+          const changed = Math.abs(actual - estimate) > 1e-9
+          const stockNow = Number(ing?.kiasi_kilichopo || 0)
+          const after = stockNow - actual
+          const negative = after < 0
+          const context = row.mapishi_ladha
+            ? `${row.mapishi_ladha} — ${row.mapishi_ukubwa || ''}`
+            : row.agizo_ladha
+              ? `${row.agizo_ladha} — ${row.agizo_ukubwa || ''}`
+              : null
+
+          return (
+            <div key={row.id} className="rounded-2xl bg-espresso/[0.03] px-4 py-3">
+              <div className="flex items-start justify-between gap-3 flex-wrap">
+                <div className="min-w-0">
+                  <p className="text-sm font-semibold text-espresso">{ing?.jina}</p>
+                  <p className="text-[11px] text-espresso-muted">
+                    {row.mpishi?.jina || 'Mpishi'}
+                    {context ? ` · ${context}` : ''}
+                    {row.kumbukumbu ? ` · “${row.kumbukumbu}”` : ''}
+                  </p>
+                </div>
+                <div className="text-right shrink-0">
+                  <p className="text-[10px] uppercase tracking-wider text-espresso-muted">Aliandika</p>
+                  <p className="text-sm font-semibold text-espresso tabular-nums">
+                    {estimate} {ing?.unit}
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex items-end gap-2 mt-3 flex-wrap">
+                <div>
+                  <label className="block text-[10px] uppercase tracking-wider text-espresso-muted mb-1">
+                    Kiasi halisi
+                  </label>
+                  <input
+                    type="number"
+                    min="0"
+                    step="0.25"
+                    value={typed === undefined ? String(estimate) : typed}
+                    onChange={(e) => setDraft((d) => ({ ...d, [row.id]: e.target.value }))}
+                    className="w-24 rounded-xl bg-white ring-1 ring-espresso/10 px-3 py-2 text-sm text-espresso tabular-nums"
+                  />
+                </div>
+                <div className="flex-1 min-w-[9rem] pb-2">
+                  <p className="text-[11px] text-espresso-muted">
+                    Hesa sasa <span className="font-semibold tabular-nums">{stockNow} {ing?.unit}</span>
+                    {' → '}
+                    <span className={`font-semibold tabular-nums ${negative ? 'text-red-500' : 'text-sage-deep'}`}>
+                      {after} {ing?.unit}
+                    </span>
+                  </p>
+                  {changed && (
+                    <p className="text-[11px] text-copper font-medium">
+                      Tofauti na makadirio: {actual - estimate > 0 ? '+' : ''}{Math.round((actual - estimate) * 100) / 100} {ing?.unit}
+                    </p>
+                  )}
+                </div>
+                <Btn
+                  variant={changed ? 'accent' : 'ghost'}
+                  size="md"
+                  icon={Check}
+                  disabled={busy === row.id}
+                  onClick={() => confirm(row)}
+                >
+                  {busy === row.id ? 'Inahifadhi...' : 'Thibitisha'}
+                </Btn>
+              </div>
+
+              {negative && (
+                <p className="text-[11px] text-red-500 mt-2 font-medium">
+                  Hesabu hii itakuwa hasi — maana yake tuliishiwa kuliko tulivyodhani.
+                </p>
+              )}
+            </div>
+          )
+        })}
+      </div>
+
+      {msg && <p className="text-xs font-medium text-center mt-3 text-sage-deep">{msg}</p>}
+    </Card>
+  )
+}
+
 function UsageTab() {
   const { data, loading } = useQuery(KUMBUKUMU_MATUMIZI)
   const logs = data?.kumbukumbu_matumizi || []
 
   return (
-    <div className="flex flex-col gap-3 stagger">
-      {loading && <div className="flex justify-center py-12"><div className="w-5 h-5 rounded-full border-2 border-copper border-t-transparent animate-spin" /></div>}
-      {!loading && logs.length === 0 && <p className="text-sm text-espresso-muted/60 text-center py-12">Hakuna matumizi bado</p>}
-      {logs.map((l) => (
-        <Card key={l.id} className="p-4">
-          <div className="flex items-center justify-between">
-            <div className="flex flex-col gap-0.5">
-              <span className="text-sm font-medium">{l.malighafi?.jina}</span>
-              <span className="text-[11px] text-espresso-muted">
-                {l.mpishi?.jina || 'Mpishi'} · Agizo: {l.agizo?.ladha || '—'} · {new Date(l.tarehe).toLocaleString('sw')}
-              </span>
+    <div className="flex flex-col gap-4">
+      <VerifyQueue />
+      <div className="flex flex-col gap-3 stagger">
+        {loading && <div className="flex justify-center py-12"><div className="w-5 h-5 rounded-full border-2 border-copper border-t-transparent animate-spin" /></div>}
+        {!loading && logs.length === 0 && <p className="text-sm text-espresso-muted/60 text-center py-12">Hakuna matumizi bado</p>}
+        {logs.map((l) => (
+          <Card key={l.id} className="p-4">
+            <div className="flex items-center justify-between">
+              <div className="flex flex-col gap-0.5">
+                <span className="text-sm font-medium">{l.malighafi?.jina}</span>
+                <span className="text-[11px] text-espresso-muted">
+                  {l.mpishi?.jina || 'Mpishi'} · Agizo: {l.agizo?.ladha || '—'} · {new Date(l.tarehe).toLocaleString('sw')}
+                </span>
+              </div>
+              {/* A logged row is an estimate. Showing it as "-3 kg" next to a
+                  pending row implied stock already moved, so say which it is. */}
+              <div className="text-right">
+                {l.hali === 'inakadiriwa' ? (
+                  <span className="text-[10px] font-semibold uppercase tracking-wider text-copper">
+                    Hakijathibitishwa
+                  </span>
+                ) : (
+                  <span className="text-xs font-semibold text-copper tabular-nums">
+                    -{l.kiasi_halisi ?? l.kiasi} {l.malighafi?.unit}
+                  </span>
+                )}
+                <p className="text-[11px] text-espresso-muted tabular-nums">
+                  aliandika {l.kiasi} {l.malighafi?.unit}
+                </p>
+              </div>
             </div>
-            <span className="text-xs font-semibold text-copper tabular-nums">-{l.kiasi} {l.malighafi?.unit}</span>
-          </div>
-        </Card>
-      ))}
+          </Card>
+        ))}
+      </div>
     </div>
   )
 }

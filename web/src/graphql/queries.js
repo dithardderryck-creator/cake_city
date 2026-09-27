@@ -61,12 +61,31 @@ export const MAUZO_YA_LEO = gql`
 `
 
 export const KUMBUKUMU_MATUMIZI = gql`
-  query KumbukumbuMatumizi($agizoId: ID) {
-    kumbukumbu_matumizi(agizo_id: $agizoId) {
+  query KumbukumbuMatumizi($agizoId: ID, $kutoka: Date, $kutia: Date) {
+    kumbukumbu_matumizi(agizo_id: $agizoId, tarehe_kutoka: $kutoka, tarehe_kutia: $kutia) {
       id kiasi kiasi_halisi hali tarehe
       malighafi { id jina unit }
       mpishi { id jina }
       agizo { id ladha }
+    }
+  }
+`
+
+/**
+ * One ingredient in depth. `mwenendo` is real: every point comes from a recorded
+ * movement anchored to the live quantity, so the chart can be trusted. Days
+ * without movement are absent rather than drawn as a flat invented line.
+ */
+export const MALEZO_MALIGHAFI = gql`
+  query MaelezoMalighafi($id: ID!) {
+    maelezo_malighafi(id: $id) {
+      malighafi { id jina kiasi_kilichopo kiwango_cha_chini unit }
+      vipengele {
+        id aina kiasi mabadiliko tarehe sababu agizo_id
+        mwingilieji { id jina }
+      }
+      mapishi { mapishi_id ladha ukubwa kiasi_cha_chini kiasi_cha_juu }
+      mwenendo { tarehe mabadiliko kiasi }
     }
   }
 `
@@ -87,8 +106,8 @@ export const MALIGHAFI = gql`
 `
 
 export const MAREKEBISHO_HISA = gql`
-  query MarekebishoHisa {
-    marekebisho_hisa {
+  query MarekebishoHisa($kutoka: Date, $kutia: Date) {
+    marekebisho_hisa(tarehe_kutoka: $kutoka, tarehe_kutia: $kutia) {
       id aina kiasi sababu tarehe
       malighafi { id jina unit }
       created_by { id jina }
@@ -101,6 +120,13 @@ export const STAFF = gql`
     staff { id jina jukumu active }
   }
 `
+
+export const WATUMISHI = gql`
+  query Watumishi {
+    watumishi { id jina jukumu }
+  }
+`
+
 
 export const RIPORT_DASHBOARD = gql`
   query RiportDashboard {

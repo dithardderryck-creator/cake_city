@@ -7,17 +7,18 @@
     "node": ">=20"
   },
   "scripts": {
+    "demo:seed": "node scripts/seed-demo-day.js",
+    "demo:clear": "node scripts/clear-demo-day.js",
+    "demo:audit": "node scripts/demo-audit.js",
+    "verify:all": "bash scripts/verify-all.sh",
+    "verify:graphql": "node scripts/validate-graphql-ops.js",
+    "verify": "node scripts/verify-fixes.js",
+    "verify:recipes": "node scripts/verify-recipes.js",
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
     "db:init": "node src/db/init.js",
     "db:reset": "dropdb --if-exists cakecity && createdb cakecity && node src/db/init.js",
-    "db:migrate": "node -e \"require('dotenv').config({quiet:true});const{runMigrations}=require('./src/db/migrate');const p=require('./src/db/pool');runMigrations().then(a=>{console.log(a.length?'Applied: '+a.join(', '):'Already up to date');return p.end()}).then(()=>process.exit(0))\"",
-    "verify": "node scripts/verify-fixes.js",
-    "verify:graphql": "node scripts/validate-graphql-ops.js",
-    "verify:recipes": "node scripts/verify-recipes.js",
-    "demo:seed": "node scripts/seed-demo-day.js",
-    "demo:clear": "node scripts/clear-demo-day.js",
-    "verify:all": "bash scripts/verify-all.sh"
+    "db:migrate": "node -e \"require('dotenv').config({quiet:true});const{runMigrations}=require('./src/db/migrate');const p=require('./src/db/pool');runMigrations().then(a=>{console.log(a.length?'Applied: '+a.join(', '):'Already up to date');return p.end()}).then(()=>process.exit(0))\""
   },
   "dependencies": {
     "@apollo/server": "^4.11.3",

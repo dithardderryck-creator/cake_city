@@ -24,6 +24,11 @@ const log = (m) => console.log(`  ${String(++step).padStart(2, '0')}. ${m}`);
 const created = {
   kategoria: [], bidhaa: [], malighafi: [], mapishi: [], mteja: [],
   agizo: [], mauzo: [], ombi: [], marekebisho: [], kumbukumbu: [],
+  // Picked up by the sweep rather than pushed at a call site: the app writes a
+  // ticket when it takes the money for an order. ukumbusho is here so the shape is
+  // complete, but the forecast engine owns that table and the sweep leaves it
+  // alone — see BASELINE_ONLY.
+  tikiti: [], ukumbusho: [],
 };
 
 async function main() {
@@ -48,31 +53,86 @@ async function main() {
   const staffIds = staff.map((s) => s.id);
   console.log(`  Staff on shift: ${staff.map((s) => `${s.jina} (${s.jukumu})`).join(', ')}\n`);
 
-  // Customers can be created by the app rather than by this script — a walk-in
-  // typed at the counter is inserted inside unda_agizo, and a repeat customer is
-  // matched there too. Snapshotting the existing ids lets the manifest account
-  // for every customer that appears during the run, so clearing the demo day
-  // does not leave orphans behind.
-  const preExistingMteja = new Set(
-    (await sql('SELECT id FROM mteja')).map((r) => Number(r.id))
-  );
-  const preExistingMalighafi = new Set(
-    (await sql('SELECT id FROM malighafi')).map((r) => Number(r.id))
-  );
-  const sweepAppCreated = async () => {
-    const nowMteja = await sql('SELECT id FROM mteja ORDER BY id');
-    for (const r of nowMteja) {
-      if (!preExistingMteja.has(Number(r.id)) && !created.mteja.includes(r.id)) {
-        created.mteja.push(r.id);
-      }
-    }
-    const nowIng = await sql('SELECT id FROM malighafi ORDER BY id');
-    for (const r of nowIng) {
-      if (!preExistingMalighafi.has(Number(r.id)) && !created.malighafi.includes(r.id)) {
-        created.malighafi.push(r.id);
-      }
-    }
+  // Rows are not only created by the lines of this script. A walk-in typed at the
+  // counter is inserted inside unda_agizo, an order deposit writes a sale of its
+  // own, and the shop raises stock reminders on its own. So rather than recording
+  // an id at each call site, the whole run is bracketed by a baseline: anything
+  // that exists afterwards and did not exist before belongs to the demo day.
+  //
+  // The ids that already existed, per table, before a single row went in. Without
+  // this the manifest can only describe what it added, so a row left behind by a
+  // test run is indistinguishable from more demo data and the day quietly stops
+  // matching its own takings. It is what lets demo:audit separate "shop data"
+  // from "leftover", and what lets demo:clear avoid deleting real rows.
+  const BASELINE_TABLES = {
+    kategoria: 'kategoria',
+    bidhaa: 'bidhaa',
+    malighafi: 'malighafi',
+    mapishi: 'mapishi',
+    mteja: 'mteja',
+    agizo: 'agizo_maalum',
+    mauzo: 'mauzo',
+    mtumiaji: 'mtumiaji',
+    ombi: 'ombi',
+    marekebisho: 'marekebisho_hisa',
+    kumbukumbu: 'kumbukumbu_matumizi',
+    // A ticket is written by the app when an order is paid, so it is picked up
+    // by the sweep rather than pushed at the call site. Unlike reminders, one
+    // ticket per paid order is stable, so the manifest can safely claim it.
+    tikiti: 'tikiti',
   };
+
+  // Recorded as a baseline so demo:clear knows not to touch reminders the shop
+  // already had, but deliberately not swept into `created`. Reminders are the
+  // forecast engine's output, it re-raises them on its own schedule, and it
+  // reaches conclusions that change as the day is verified — so claiming them
+  // would make the manifest wrong every time the engine next runs.
+  const BASELINE_ONLY = { ukumbusho: 'ukumbusho' };
+
+  const baseline = {};
+  for (const [key, table] of Object.entries({ ...BASELINE_TABLES, ...BASELINE_ONLY })) {
+    baseline[key] = (await sql(`SELECT id FROM ${table} ORDER BY id`)).map((r) => Number(r.id));
+  }
+
+  // The ingredients the shop already stocked, with the levels it had. The seed
+  // reuses those rows rather than creating new ones, so it moves real balances:
+  // it opens a delivery and then records usage against them. Ids alone cannot put
+  // that back afterwards — deleting the day's usage and restocks leaves the
+  // opening delivery still applied, so the balance settles higher than it started
+  // and every later seed inherits the drift. These values are what demo:clear
+  // restores.
+  const baselineLevels = {
+    malighafi: (
+      await sql(
+        `SELECT id, jina, kiasi_kilichopo, kiwango_cha_chini, unit
+           FROM malighafi ORDER BY id`
+      )
+    ).map((r) => ({
+      id: Number(r.id),
+      jina: r.jina,
+      kiasi_kilichopo: String(r.kiasi_kilichopo),
+      kiwango_cha_chini: String(r.kiwango_cha_chini),
+      unit: r.unit,
+    })),
+  };
+    // Anything that came into existence during the seed run but was not in the
+    // baseline belongs to the demo day, however it got created. Sweeping is more
+    // dependable than recording ids at each call site: the order deposits, the
+    // second payments and the reminders the shop raises on its own are all written
+    // by the system rather than by a line of this script, and an earlier version
+    // that only pushed the five counter sales it created itself left the eleven
+    // order payments unrecorded.
+    const sweepAppCreated = async () => {
+      for (const [key, table] of Object.entries(BASELINE_TABLES)) {
+        if (key in BASELINE_ONLY) continue;
+        const known = new Set(baseline[key].map(Number));
+        const now = await sql(`SELECT id FROM ${table} ORDER BY id`);
+        for (const r of now) {
+          const id = Number(r.id);
+          if (!known.has(id) && !created[key].includes(id)) created[key].push(id);
+        }
+      }
+    };
 
   const savedHashes = staff.map((s) => ({ id: s.id, pin_hash: s.pin_hash }));
   let outcome = 'complete';
@@ -364,15 +424,17 @@ async function main() {
     // string while SQL returns an integer, so the same row can otherwise be
     // recorded twice under two different types, and the "already recorded"
     // checks above silently stop matching.
-    for (const key of Object.keys(created)) {
-      created[key] = [...new Set(created[key].map((v) => Number(v)))].sort((a, b) => a - b);
-    }
-    writeManifest({
-      seededAt: new Date().toISOString(),
-      shopDate: today.d,
-      outcome,
-      created,
-    });
+      for (const key of Object.keys(created)) {
+        created[key] = [...new Set(created[key].map((v) => Number(v)))].sort((a, b) => a - b);
+      }
+      writeManifest({
+        seededAt: new Date().toISOString(),
+        shopDate: today.d,
+        outcome,
+        baseline,
+        baselineLevels,
+        created,
+      });
     if (outcome !== 'complete') {
       console.log('\n  Seed did not finish, but a manifest was still written.');
       console.log('  Run `npm run demo:clear` to remove the partial day.\n');
@@ -419,10 +481,53 @@ async function backdate(created, shopDate) {
     ]);
   }
 
-  await sql(`UPDATE marekebisho_hisa SET tarehe = ($1::date + interval '7 hours 30 minutes') WHERE id = ANY($2::int[])`, [
-    shopDate, created.marekebisho,
-  ]);
-}
+    await sql(`UPDATE marekebisho_hisa SET tarehe = ($1::date + interval '7 hours 30 minutes') WHERE id = ANY($2::int[])`, [
+      shopDate, created.marekebisho,
+    ]);
+
+    // Usage logs were left at the moment the seed actually ran, which made the
+    // stock history collapse: the ingredient detail chart buckets by the day a
+    // movement landed, and every line landed on the same day, so the trend drew
+    // a single point no matter how much history the day had.
+    //
+    // The chef logs an estimate and inventory confirms the real number later, so
+    // the two timestamps are set apart: the log in the morning, the confirmation
+    // a few hours afterwards, both inside the day.
+    const u = created.kumbukumbu.length;
+    for (let i = 0; i < u; i += 1) {
+      const logged = 8 * 60 + Math.round((i * (8 * 60)) / Math.max(1, u));
+      const confirmed = logged + 45 + (i % 5) * 15;
+      const t = (mins) =>
+        `${String(Math.floor((mins % (24 * 60)) / 60)).padStart(2, '0')}:${String(mins % 60).padStart(2, '0')}:00`;
+      await sql(
+        `UPDATE kumbukumbu_matumizi
+            SET tarehe = ($2::date + $3::time),
+                tarehe_ya_uthibitisho = CASE WHEN hali = 'imethibitishwa'
+                                     THEN ($2::date + $4::time) ELSE NULL END
+          WHERE id = $1`,
+        [created.kumbukumbu[i], shopDate, t(logged), t(confirmed)]
+      );
+    }
+
+    // Requests and reminders feed the inventory screen's badges and lists, so
+    // they belong to the day too rather than to the moment the script ran.
+    const o = created.ombi.length;
+    for (let i = 0; i < o; i += 1) {
+      const mins = 9 * 60 + Math.round((i * (6 * 60)) / Math.max(1, o));
+      await sql(`UPDATE ombi SET created_at = ($2::date + $3::time) WHERE id = $1`, [
+        created.ombi[i], shopDate,
+        `${String(Math.floor(mins / 60)).padStart(2, '0')}:${String(mins % 60).padStart(2, '0')}:00`,
+      ]);
+    }
+    const r = created.ukumbusho.length;
+    for (let i = 0; i < r; i += 1) {
+      const mins = 7 * 60 + 30 + Math.round((i * (9 * 60)) / Math.max(1, r));
+      await sql(`UPDATE ukumbusho SET created_at = ($2::date + $3::time) WHERE id = $1`, [
+        created.ukumbusho[i], shopDate,
+        `${String(Math.floor(mins / 60)).padStart(2, '0')}:${String(mins % 60).padStart(2, '0')}:00`,
+      ]);
+    }
+  }
 
 main()
   .then(async () => { await pool.end(); process.exit(0); })

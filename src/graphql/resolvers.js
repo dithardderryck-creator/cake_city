@@ -582,6 +582,18 @@ const resolvers = {
       return rows;
     },
 
+    // Who a request can be addressed to. Deliberately not gated on staff.manage:
+    // that permission belongs to the owner alone, and an inventory clerk who
+    // cannot see a list of colleagues cannot raise a purchase request at all.
+    // It returns active staff only, with no join date and no inactive accounts.
+    watumishi: async (_, __, ctx) => {
+      requireAuthenticated(ctx.user);
+      const { rows } = await pool.query(
+        'SELECT id, jina, jukumu, active FROM mtumiaji WHERE active ORDER BY jina'
+      );
+      return rows;
+    },
+
     bidhaa: async (_, { active }, ctx) => {
       requireCan(ctx.user, 'stock.read');
       // Reuse stock.read as the least-privilege read gate; all four roles read products for their workflows.
@@ -663,15 +675,19 @@ const resolvers = {
       return rows;
     },
 
-    kumbukumbu_matumizi: async (_, { agizo_id }, ctx) => {
-      requireCan(ctx.user, 'usage.read_all');
-      const where = [];
-      const params = [];
-      if (agizo_id) { params.push(agizo_id); where.push(`agizo_id = $${params.length}`); }
-      const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
-      const { rows } = await pool.query(`SELECT * FROM kumbukumbu_matumizi ${whereSql} ORDER BY tarehe DESC`, params);
-      return rows;
-    },
+      kumbukumbu_matumizi: async (_, { agizo_id, tarehe_kutoka, tarehe_kutia }, ctx) => {
+        requireCan(ctx.user, 'usage.read_all');
+        const where = [];
+        const params = [];
+        if (agizo_id) { params.push(agizo_id); where.push(`agizo_id = $${params.length}`); }
+        // Both bounds compare against the local date, so "the last 7 days" means
+        // the same seven days the shop is trading in rather than UTC days.
+        if (tarehe_kutoka) { params.push(tarehe_kutoka); where.push(`tarehe >= $${params.length}::date`); }
+        if (tarehe_kutia) { params.push(tarehe_kutia); where.push(`tarehe < $${params.length}::date + INTERVAL '1 day'`); }
+        const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+        const { rows } = await pool.query(`SELECT * FROM kumbukumbu_matumizi ${whereSql} ORDER BY tarehe DESC`, params);
+        return rows;
+      },
 
       hisa: async (_, __, ctx) => {
         requireCan(ctx.user, 'stock.read');
@@ -689,7 +705,134 @@ const resolvers = {
         return { items, lowStock };
       },
 
-      malighafi: async (_, __, ctx) => {
+      /**
+     * One ingredient, in depth: the live balance, every movement that explains
+     * it, and the recipes the kitchen spends it on.
+     *
+     * The history is read out of the real ledger rather than extrapolated. An
+     * earlier version of the stock screen drew a 14-day "actual" line by walking
+     * backwards from the current quantity at the current usage rate, which
+     * produced a smooth and entirely invented history — a shop with three days
+     * of trading looked like it had a fortnight of data. Here the daily closing
+     * balances are anchored to the quantity the database actually holds today and
+     * stepped back through recorded movements, so every point is defensible. Days
+     * with no movement are omitted rather than filled in with an invented flat
+     * line; today is always included because it is the anchor.
+     */
+    maelezo_malighafi: async (_, { id }, ctx) => {
+      requireCan(ctx.user, 'stock.read');
+      const ing = (await pool.query('SELECT * FROM malighafi WHERE id = $1', [id])).rows[0];
+      if (!ing) throw new GraphQLError('Malighafi hayapatikani.', { extensions: { code: 'NOT_FOUND' } });
+
+        const [usage, adjustments, recipes] = await Promise.all([
+          pool.query(
+            `SELECT k.id, k.kiasi_halisi, k.tarehe, k.tarehe_ya_uthibitisho, k.agizo_id, k.kumbukumbu,
+                    k.imethibitishwa_na,
+                    COALESCE(k.tarehe_ya_uthibitisho, k.tarehe)::date::text AS tarehe_ya_kutoka,
+                    a.ladha AS agizo_ladha, m.ladha AS mapishi_ladha
+               FROM kumbukumbu_matumizi k
+               LEFT JOIN agizo_maalum a ON a.id = k.agizo_id
+               LEFT JOIN mapishi m       ON m.id = a.mapishi_id
+              WHERE k.malighafi_id = $1
+                AND k.hali = 'imethibitishwa'
+                AND k.kiasi_halisi IS NOT NULL
+              ORDER BY k.id`,
+            [id]
+          ),
+          pool.query(
+            `SELECT r.id, r.kiasi, r.aina, r.tarehe, r.sababu, r.created_by,
+                    r.tarehe::date::text AS tarehe_ya_kutoka
+               FROM marekebisho_hisa r WHERE r.malighafi_id = $1
+              ORDER BY r.id`,
+            [id]
+          ),
+          pool.query(
+            `SELECT m.id AS mapishi_id, m.ladha, m.ukubwa, v.kiasi_cha_chini, v.kiasi_cha_juu
+               FROM mapishi_kipengele v
+               JOIN mapishi m ON m.id = v.mapishi_id
+              WHERE v.malighafi_id = $1 AND m.active = true
+              ORDER BY m.ladha, m.ukubwa`,
+            [id]
+          ),
+        ]);
+
+        // The two sources have separate id sequences, so a raw id would collide
+        // across them and React would reuse one row's markup for another. The
+        // prefix keeps every line uniquely addressable.
+        const vipengele = [
+          ...usage.rows.map((r) => ({
+            id: `matumizi-${r.id}`,
+            aina: 'matumizi',
+            kiasi: Number(r.kiasi_halisi),
+            // The verification time is when stock actually moved, so it is the
+            // honest date for this line. The chef may have logged it hours earlier.
+            tarehe: r.tarehe_ya_uthibitisho || r.tarehe,
+            tarehe_ya_kutoka: r.tarehe_ya_kutoka,
+            sababu: r.kumbukumbu || r.mapishi_ladha || r.agizo_ladha || null,
+            agizo_id: r.agizo_id,
+            mwingilieji_id: r.imethibitishwa_na,
+          })),
+          ...adjustments.rows.map((r) => ({
+            id: `${r.aina}-${r.id}`,
+            aina: r.aina === 'restock' ? 'kujaza' : 'upotevu',
+            kiasi: Number(r.kiasi),
+            tarehe: r.tarehe,
+            tarehe_ya_kutoka: r.tarehe_ya_kutoka,
+            sababu: r.sababu,
+            agizo_id: null,
+            mwingilieji_id: r.created_by,
+          })),
+        ].sort((a, b) => new Date(b.tarehe) - new Date(a.tarehe));
+
+      for (const v of vipengele) {
+        v.mabadiliko = v.aina === 'kujaza' ? v.kiasi : -v.kiasi;
+      }
+
+      // One entry per day that moved, plus today as the anchor. Bucketing uses
+      // the date Postgres returned, never a JS Date stringified — that yields
+      // locale text like "Sun Sep 27" and silently splits one day in two.
+      const perDay = new Map();
+      for (const v of vipengele) {
+        perDay.set(v.tarehe_ya_kutoka, (perDay.get(v.tarehe_ya_kutoka) || 0) + v.mabadiliko);
+      }
+      const today = (await pool.query('SELECT CURRENT_DATE::text AS d')).rows[0].d;
+      if (!perDay.has(today)) perDay.set(today, 0);
+      const days = [...perDay.keys()].sort();
+
+      const mwenendo = [];
+      let running = Number(ing.kiasi_kilichopo);
+      for (let i = days.length - 1; i >= 0; i -= 1) {
+        mwenendo.push({ tarehe: days[i], mabadiliko: perDay.get(days[i]), kiasi: running });
+        running -= perDay.get(days[i]);
+      }
+
+        // Who moved the stock, for the ledger's "by" column. Resolved in one
+        // query rather than per line: the earlier version handed the raw id back
+        // where the schema promises an Mtumiaji, so any client selecting the name
+        // got a type error instead of a name.
+        const who = vipengele.map((v) => v.mwingilieji_id).filter(Boolean);
+        const staff = who.length
+          ? (
+              await pool.query(
+                `SELECT id, jina, jukumu FROM mtumiaji WHERE id = ANY($1::int[])`,
+                [[...new Set(who)]]
+              )
+            ).rows
+          : [];
+        const byId = Object.fromEntries(staff.map((s) => [String(s.id), s]));
+
+        return {
+          malighafi: ing,
+          vipengele: vipengele.map((v) => ({
+            ...v,
+            mwingilieji: v.mwingilieji_id ? byId[String(v.mwingilieji_id)] || null : null,
+          })),
+          mapishi: recipes.rows,
+          mwenendo: mwenendo.reverse(),
+        };
+    },
+
+    malighafi: async (_, __, ctx) => {
         requireCan(ctx.user, 'stock.read');
         const { rows } = await pool.query(`SELECT * FROM malighafi WHERE active ORDER BY jina`);
         return rows;
@@ -746,12 +889,20 @@ const resolvers = {
         return rows;
       },
 
-    marekebisho_hisa: async (_, __, ctx) => {
+    marekebisho_hisa: async (_, { tarehe_kutoka, tarehe_kutia }, ctx) => {
       requireAuthenticated(ctx.user);
       if (!can(ctx.user, 'usage.read_all') && !can(ctx.user, 'stock.adjust_restock') && !can(ctx.user, 'stock.adjust_waste')) {
         throw new GraphQLError('Hamna ruhusa ya kuona marekebisho.', { extensions: { code: 'FORBIDDEN' } });
       }
-      const { rows } = await pool.query('SELECT * FROM marekebisho_hisa ORDER BY tarehe DESC');
+      const where = [];
+      const params = [];
+      if (tarehe_kutoka) { params.push(tarehe_kutoka); where.push(`tarehe >= $${params.length}::date`); }
+      if (tarehe_kutia) { params.push(tarehe_kutia); where.push(`tarehe < $${params.length}::date + INTERVAL '1 day'`); }
+      const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+      const { rows } = await pool.query(
+        `SELECT * FROM marekebisho_hisa ${whereSql} ORDER BY tarehe DESC`,
+        params
+      );
       return rows;
     },
 

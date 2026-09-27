@@ -39,23 +39,42 @@ trap stop_api EXIT INT TERM
 : >"$LOG"
 status=0
 
-for suite in verify verify:recipes; do
-  echo ""
-  echo "=== $suite ==="
-  start_api || exit 1
-  npm run "$suite"
-  rc=$?
-  stop_api
-  if [ $rc -ne 0 ]; then
-    status=$rc
-    echo "=== $suite FAILED ==="
-  fi
-done
+  for suite in verify verify:recipes; do
+    echo ""
+    echo "=== $suite ==="
+    start_api || exit 1
+    npm run "$suite"
+    rc=$?
+    stop_api
+    if [ $rc -ne 0 ]; then
+      status=$rc
+      echo "=== $suite FAILED ==="
+    fi
+  done
 
-echo ""
-if [ $status -eq 0 ]; then
-  echo "All suites passed."
-else
-  echo "One or more suites failed."
-fi
-exit $status
+  # The suites above create real rows through the API on purpose and delete them
+  # again. This is the check that they actually did: a suite can pass every
+  # assertion and still leave a sale or a reminder behind, and the day then stops
+  # matching its own takings without anything reporting a failure. Skipped when
+  # no demo day has been seeded, since there is then nothing to compare against.
+  echo ""
+  echo "=== demo:audit ==="
+  if [ -f backups/demo-day-manifest.json ]; then
+    npm run --silent demo:audit
+    rc=$?
+    if [ $rc -ne 0 ]; then
+      status=$rc
+      echo "=== demo:audit FAILED ==="
+      echo "The suites changed data they did not clean up. See above for the exact rows."
+    fi
+  else
+    echo "No demo manifest, nothing to audit. Skipped."
+  fi
+
+  echo ""
+  if [ $status -eq 0 ]; then
+    echo "All suites passed."
+  else
+    echo "One or more suites failed."
+  fi
+  exit $status

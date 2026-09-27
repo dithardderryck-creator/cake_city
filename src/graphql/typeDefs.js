@@ -233,6 +233,59 @@ module.exports = gql`
     agizo_id: ID
   }
 
+  "A kind of movement in the stock ledger. Usage only counts once confirmed, so an unconfirmed estimate never produces one of these."
+  enum AinaMabadiliko {
+    "Confirmed usage — stock went down because the kitchen used it."
+    matumizi
+    "A delivery arrived — stock went up."
+    kujaza
+    "Spoiled, dropped or expired — stock went down without being used."
+    upotevu
+  }
+
+  "One line of an ingredient's ledger: everything that explains its current number."
+  type MabadilikoHisa {
+    id: ID!
+    aina: AinaMabadiliko!
+    kiasi: Float!
+    tarehe: DateTime!
+    "Why it happened. Free text for wastage and deliveries, the recipe or order name for usage."
+    sababu: String
+    "Who recorded it."
+    mwingilieji: Mtumiaji
+    "The order this usage belongs to, when there is one."
+    agizo_id: ID
+    "Positive for a delivery, negative for usage or wastage. Ready to be added to a running balance."
+    mabadiliko: Float!
+  }
+
+  "A recipe that calls for this ingredient, and how much of it per batch."
+  type MapishiInayotumika {
+    mapishi_id: ID!
+    ladha: String!
+    ukubwa: String
+    kiasi_cha_chini: Float!
+    kiasi_cha_juu: Float!
+  }
+
+  "One day's real net movement and the balance it left behind. Only days that actually moved are returned — no invented flat days."
+  type SikuHisa {
+    tarehe: Date!
+    "Net change that day. Positive for a delivery, negative for usage and wastage."
+    mabadiliko: Float!
+    "Balance at the end of that day, derived from the current stock and this day's real movement."
+    kiasi: Float!
+  }
+
+  "Everything the stock screen needs about one ingredient: the live balance, the ledger that explains it, and what the kitchen spends it on."
+  type MaelezoMalighafi {
+    malighafi: Malighafi!
+    vipengele: [MabadilikoHisa!]!
+    mapishi: [MapishiInayotumika!]!
+    "Oldest first. Empty when this ingredient has never moved."
+    mwenendo: [SikuHisa!]!
+  }
+
   type KumbukumbuMatumizi {
     id: ID!
     agizo: AgizoMaalum
@@ -315,16 +368,27 @@ module.exports = gql`
     me: Mtumiaji
     wafanyakazi: [Mtumiaji!]!
     staff: [Mtumiaji!]!
+    """
+    Active staff only, for pickers such as the request composer. Every signed-in
+    role can read this: it exposes nothing beyond the names already printed
+    against orders, which is why it is separate from the "staff" query, which is
+    gated on staff.manage and would otherwise leave the inventory clerk unable
+    to address a request to anybody.
+    """
+    watumishi: [Mtumiaji!]!
     bidhaa(active: Boolean): [Bidhaa!]!
     wateja(search: String): [Mteja!]!
     agizo_maalum(hali: HaliOrder, tarehe_ya_kuchukua: Date): [AgizoMaalum!]!
     order_kwajikoni: [AgizoMaalum!]!
     mauzo(tarehe: Date, njia_ya_malipo: NjiaMalipo): [Mauzo!]!
     mauzo_ya_leo: [Mauzo!]!
-    kumbukumbu_matumizi(agizo_id: ID): [KumbukumbuMatumizi!]!
+    kumbukumbu_matumizi(agizo_id: ID, tarehe_kutoka: Date, tarehe_kutia: Date): [KumbukumbuMatumizi!]!
     hisa: AllStock!
+    "One ingredient with its real movement history, what the kitchen spends it on, and the daily balances behind them."
+    maelezo_malighafi(id: ID!): MaelezoMalighafi
     malighafi: [Malighafi!]!
-    marekebisho_hisa: [MarekebishoHisa!]!
+    "Omit both dates for the whole ledger. Both filter on the local (Tanzania) day."
+    marekebisho_hisa(tarehe_kutoka: Date, tarehe_kutia: Date): [MarekebishoHisa!]!
     riport_dashboard: Dashboard!
     ukumbusho: [Ukumbusho!]!
     utabiri_hisa(kiasi_chini_ya_siku: Int): [UtabiriHisa!]!

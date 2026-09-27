@@ -11,7 +11,9 @@
  * Test data is created and removed around each case. Nothing is left behind.
  */
 
-const BASE = process.env.VERIFY_BASE || 'http://localhost:4000';
+   const { readFileSync } = require('fs');
+   const { join } = require('path');
+   const BASE = process.env.VERIFY_BASE || 'http://localhost:4000';
 const GRAPHQL = `${BASE}/graphql`;
 
 let passed = 0;
@@ -29,17 +31,17 @@ function check(name, condition, detail = '') {
   }
 }
 
-async function gql(query, token) {
-  const res = await fetch(GRAPHQL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
-    },
-    body: JSON.stringify({ query }),
-  });
-  return res.json();
-}
+   async function gql(query, token, variables) {
+     const res = await fetch(GRAPHQL, {
+       method: 'POST',
+       headers: {
+         'Content-Type': 'application/json',
+         ...(token ? { Authorization: `Bearer ${token}` } : {}),
+       },
+       body: JSON.stringify({ query, ...(variables ? { variables } : {}) }),
+     });
+     return res.json();
+   }
 
 const errOf = (json) => json?.errors?.[0];
 const codeOf = (json) => errOf(json)?.extensions?.code;
@@ -321,6 +323,193 @@ async function main() {
   // ---- H1: sale timestamp is actually selectable -----------------------
   const withTs = await gql('{mauzo_ya_leo{id created_at}}', ownerToken);
   check('H1 mauzo_ya_leo exposes created_at', withTs?.errors === undefined, msgOf(withTs));
+
+  // ---- Ingredient history must be derived, not invented -----------------
+  // The stock screen used to draw a 14-day "actual" line by walking backwards
+  // from the current quantity at the current usage rate, which fabricated a
+  // fortnight of trading from whatever data happened to exist. These checks pin
+  // the replacement: the series is anchored to the stored quantity, carries one
+  // point per day that actually moved, and agrees with the ledger to the cent.
+  const detail = await gql(
+    `query{maelezo_malighafi(id:${ingId}){malighafi{kiasi_kilichopo}
+       vipengele{aina kiasi mabadiliko}
+       mapishi{ladha}
+       mwenendo{tarehe mabadiliko kiasi}}}`,
+    ownerToken
+  );
+  const md = detail?.data?.maelezo_malighafi;
+  check('S1 maelezo_malighafi returns the ingredient', Boolean(md), msgOf(detail));
+
+  const moves = md?.vipengele || [];
+  const usageMoves = moves.filter((v) => v.aina === 'matumizi');
+  // The fixture verified 8 against a starting balance of 5, so stock is left
+  // negative on purpose. Negative stock is a real signal, not an error, and the
+  // ledger has to carry it faithfully rather than clamping it away.
+  check(
+    'S1 confirmed usage appears in the ledger at the verified amount',
+    usageMoves.some((v) => Math.abs(v.kiasi - 8) < 1e-9),
+    JSON.stringify(moves.map((v) => `${v.aina}:${v.kiasi}`))
+  );
+  check(
+    'S1 usage reduces stock in the ledger',
+    usageMoves.every((v) => v.mabadiliko < 0),
+    JSON.stringify(usageMoves.map((v) => v.mabadiliko))
+  );
+  check(
+    'S1 the ledger can carry stock below zero without being clamped',
+    Math.abs((md?.malighafi?.kiasi_kilichopo ?? 0) - -3) < 1e-9,
+    `stored ${md?.malighafi?.kiasi_kilichopo}, expected -3`
+  );
+  check(
+    'S1 a restock would increase stock in the ledger',
+    moves.filter((v) => v.aina !== 'matumizi').every((v) => v.mabadiliko > 0),
+    JSON.stringify(moves.map((v) => `${v.aina}:${v.mabadiliko}`))
+  );
+
+  // Every ledger line must be present in the daily series, and the series must
+  // sum to the same net movement. A dropped line here is what makes a chart lie.
+  const dayNet = (md?.mwenendo || []).reduce((a, d) => a + d.mabadiliko, 0);
+  const ledgerNet = moves.reduce((a, v) => a + v.mabadiliko, 0);
+  check(
+    'S1 daily series accounts for every ledger movement',
+    Math.abs(dayNet - ledgerNet) < 1e-6,
+    `series ${dayNet} vs ledger ${ledgerNet}`
+  );
+
+  const lastDay = (md?.mwenendo || []).at(-1);
+  check(
+    'S1 last plotted balance equals the stored quantity',
+    lastDay && Math.abs(lastDay.kiasi - md.malighafi.kiasi_kilichopo) < 1e-9,
+    lastDay ? `${lastDay.kiasi} vs ${md.malighafi.kiasi_kilichopo}` : 'no points'
+  );
+  check(
+    'S1 no duplicate day points (one bucket per calendar day)',
+    new Set((md?.mwenendo || []).map((d) => d.tarehe)).size === (md?.mwenendo || []).length,
+    JSON.stringify((md?.mwenendo || []).map((d) => d.tarehe))
+  );
+  check(
+    'S1 mwenendo is oldest first',
+    (md?.mwenendo || []).every((d, i, a) => i === 0 || a[i - 1].tarehe <= d.tarehe),
+    JSON.stringify((md?.mwenendo || []).map((d) => d.tarehe))
+  );
+
+  // An ingredient nobody has touched yet must still anchor on today rather
+  // than returning an empty series the chart cannot draw.
+  const untouched = await sql(
+    `INSERT INTO malighafi (jina,kiasi_kilichopo,kiwango_cha_chini,unit) VALUES ('ZZ-UNTOUCHED',7,2,'kg') RETURNING id`
+  );
+  const untouchedId = untouched[0].id;
+  const uDetail = await gql(
+    `query{maelezo_malighafi(id:${untouchedId}){vipengele{id} mwenendo{tarehe mabadiliko kiasi}}}`,
+    ownerToken
+  );
+  const ud = uDetail?.data?.maelezo_malighafi;
+  check('S1 an untouched ingredient has an empty ledger', (ud?.vipengele || []).length === 0, msgOf(uDetail));
+  check(
+    'S1 an untouched ingredient still anchors on today',
+    (ud?.mwenendo || []).length === 1 && (ud?.mwenendo || [])[0].kiasi === 7,
+    JSON.stringify(ud?.mwenendo)
+  );
+    const missing = await gql(`query{maelezo_malighafi(id:99999999){malighafi{id}}}`, ownerToken);
+    check('S1 unknown ingredient is NOT_FOUND', codeOf(missing) === 'NOT_FOUND', codeOf(missing));
+    await sql('DELETE FROM malighafi WHERE id=$1', [untouchedId]);
+
+    // ---- The drawer must match the field set the screen actually asks for ---
+    // The ingredient drawer selects a specific set of fields, and three of them
+    // were once returned in a shape the screen could not render: the ledger id
+    // came back as a bare number, `mwingilieji` came back as a string where the
+    // screen expects an object, and `mapishi_id` was missing outright. GraphQL
+    // does not error on any of that, because the schema was satisfied — the
+    // breakage only showed up as blank cells in the table.
+    //
+    // Restating those fields here would just be a fourth copy to forget to
+    // update, so this runs the operation straight out of the frontend file. If
+    // the screen asks for a new field, the next run of this suite checks it too.
+    const queriesSrc = readFileSync(join(__dirname, '..', 'web', 'src', 'graphql', 'queries.js'), 'utf8');
+    const op = queriesSrc.match(/export const MALEZO_MALIGHAFI = gql`([\s\S]*?)`/);
+    check('S1 the frontend MALEZO_MALIGHAFI operation can be located', Boolean(op), 'not found in queries.js');
+
+    if (op) {
+      const live = await gql(op[1], ownerToken, { id: ingId });
+      const err = msgOf(live);
+      check('S1 the frontend operation runs without a GraphQL error', !live?.errors, err);
+      const fd = live?.data?.maelezo_malighafi;
+      check('S1 the frontend operation returns the ingredient', Boolean(fd), err);
+      check(
+        'S1 the frontend reads the ingredient id, name and unit',
+        // `id` is an ID, and GraphQL always serialises ID as a string. The drawer
+        // keys off it and compares it against the same field from HISA, so the
+        // only thing that matters is that both sides agree on the type and that
+        // it is the ingredient asked for.
+        fd?.malighafi?.id === String(ingId) &&
+          Boolean(fd?.malighafi?.jina) &&
+          Boolean(fd?.malighafi?.unit),
+        JSON.stringify(fd?.malighafi)
+      );
+      // Every ledger line is rendered as a row, so each of these has to be the
+      // type the table expects. `id` in particular is used as a React key and to
+      // tell two lines apart: namespaced ids, not a per-table row number that
+      // restarts at 1 for each of the two ledgers the drawer merges together.
+      const rows = fd?.vipengele || [];
+      check(
+        'S1 every ledger line has a usable id',
+        rows.length > 0 && rows.every((r) => typeof r.id === 'string' && /^(matumizi|restock)-/.test(r.id)),
+        JSON.stringify(rows.map((r) => r.id))
+      );
+      check(
+        'S1 ids are unique across the two ledgers',
+        new Set(rows.map((r) => r.id)).size === rows.length,
+        JSON.stringify(rows.map((r) => r.id))
+      );
+      check(
+        'S1 the person behind a movement is an object, not a bare name',
+        rows.length > 0 && rows.every((r) => r.mwingilieji === null || typeof r.mwingilieji === 'object'),
+        JSON.stringify(rows.map((r) => r.mwingilieji))
+      );
+      check(
+        'S1 a movement carries the date and reason the row displays',
+        rows.every((r) => Boolean(r.tarehe) && typeof r.sababu === 'string'),
+        JSON.stringify(rows.map((r) => [r.tarehe, r.sababu]))
+      );
+      check(
+        'S1 the recipe usage is keyed by id so the drawer can link it',
+        (fd?.mapishi || []).every((m) => typeof m.mapishi_id === 'number' && Boolean(m.ladha)),
+        JSON.stringify(fd?.mapishi)
+      );
+      check(
+        'S1 the daily series is shaped for the chart',
+        (fd?.mwenendo || []).every((d) => Boolean(d.tarehe) && typeof d.mabadiliko === 'number'),
+        JSON.stringify(fd?.mwenendo)
+      );
+    }
+
+
+  // ---- Date filters must narrow both ledgers ---------------------------
+  const narrow = await gql(
+    `{marekebisho_hisa(tarehe_kutoka:"1990-01-01",tarehe_kutia:"1990-01-02"){id}
+      kumbukumbu_matumizi(tarehe_kutoka:"1990-01-01",tarehe_kutia:"1990-01-02"){id}}`,
+    ownerToken
+  );
+  check(
+    'S1 an empty date window returns nothing',
+    narrow?.errors === undefined &&
+      (narrow?.data?.marekebisho_hisa || []).length === 0 &&
+      (narrow?.data?.kumbukumbu_matumizi || []).length === 0,
+    msgOf(narrow)
+  );
+  // Omitting the dates has to keep returning everything, or the existing
+  // Chef/Owner screens that call these queries with no arguments would silently
+  // start showing a truncated ledger.
+  const unfiltered = await gql('{marekebisho_hisa{id} kumbukumbu_matumizi{id}}', ownerToken);
+  const truth = await sql(
+    `SELECT (SELECT count(*) FROM marekebisho_hisa)::int AS m, (SELECT count(*) FROM kumbukumbu_matumizi)::int AS k`
+  );
+  check(
+    'S1 omitting the dates still returns the full ledger (back-compatible)',
+    (unfiltered?.data?.marekebisho_hisa || []).length === truth[0].m &&
+      (unfiltered?.data?.kumbukumbu_matumizi || []).length === truth[0].k,
+    `api ${(unfiltered?.data?.marekebisho_hisa || []).length}/${(unfiltered?.data?.kumbukumbu_matumizi || []).length} vs sql ${truth[0].m}/${truth[0].k}`
+  );
 
   // ---- Cleanup ---------------------------------------------------------
   await sql('DELETE FROM marekebisho_hisa WHERE malighafi_id=$1', [ingId]);

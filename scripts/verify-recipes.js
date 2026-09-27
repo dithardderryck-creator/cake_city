@@ -207,9 +207,13 @@ async function main() {
       const l = await gql(`mutation{login(id:${s.id},pin:"${FIXTURE_PIN}"){token}}`);
       return { ...s, token: l?.data?.login?.token };
     };
-    const chef = await mkStaff('Chef', 'chef');
-    const cashier = await mkStaff('Cashier', 'cashier');
-    check('fixtures: chef and cashier accounts created', Boolean(chef.token && cashier.token));
+      const chef = await mkStaff('Chef', 'chef');
+      const cashier = await mkStaff('Cashier', 'cashier');
+      const inventory = await mkStaff('Inventory', 'inventory');
+      check(
+        'fixtures: chef, cashier and inventory accounts created',
+        Boolean(chef.token && cashier.token && inventory.token)
+      );
 
     const mkIng = async (jina, kiasi, chini) => {
       const r = await gql(
@@ -581,11 +585,70 @@ async function main() {
       check(`§3.3 ${label} cannot double-close`, codeOf(again) === 'ALREADY_CLOSED', `${codeOf(again)} ${msgOf(again)}`);
     }
 
-    // The owner can still close anything.
-    const toChef = await gql(`mutation{tumia_ombi(kwenda_kwa:${chef.id},ujumbe:"${PREFIX} owner close"){id}}`, ownerToken);
-    created.ombi.push(toChef?.data?.tumia_ombi?.id);
-    const ownerClose = await gql(`mutation{fungua_ombi(id:${toChef?.data?.tumia_ombi?.id},jibu:"na owner"){hali}}`, ownerToken);
-    check('§3.3 owner can still close any request', ownerClose?.data?.fungua_ombi?.hali === 'imefanyika', msgOf(ownerClose));
+      // The owner can still close anything.
+      const toChef = await gql(`mutation{tumia_ombi(kwenda_kwa:${chef.id},ujumbe:"${PREFIX} owner close"){id}}`, ownerToken);
+      created.ombi.push(toChef?.data?.tumia_ombi?.id);
+      const ownerClose = await gql(`mutation{fungua_ombi(id:${toChef?.data?.tumia_ombi?.id},jibu:"na owner"){hali}}`, ownerToken);
+      check('§3.3 owner can still close any request', ownerClose?.data?.fungua_ombi?.hali === 'imefanyika', msgOf(ownerClose));
+
+      // =====================================================================
+      // §3.3b — the request composer needs a list of colleagues
+      // =====================================================================
+      // The stock screen's "request this" button has to offer a recipient. It
+      // was originally built on `staff`, which is gated on staff.manage, and
+      // that permission belongs to the owner alone -- so the inventory clerk got
+      // an empty dropdown and could not raise a purchase request at all. The
+      // check is here so the directory cannot be swapped back to `staff`.
+      console.log('\n  -- §3.3b a requester can see who to address --');
+      for (const who of [inventory, cashier, chef]) {
+        const dir = await gql('{watumishi{id jina jukumu}}', who.token);
+        const list = dir?.data?.watumishi || [];
+        check(
+          `§3.3b ${who.jukumu} can read the request directory`,
+          dir?.errors === undefined && list.length > 0,
+          msgOf(dir)
+        );
+        check(
+          `§3.3b the directory shown to ${who.jukumu} names the owner`,
+          list.some((s) => s.jukumu === 'owner' && s.id !== null && s.jina),
+          JSON.stringify(list.map((s) => s.jina))
+        );
+        check(
+          `§3.3b the directory exposes no join date or inactive account`,
+          await (async () => {
+            const { rows } = await pool.query(
+              `SELECT count(*)::int AS n FROM mtumiaji WHERE NOT active`
+            );
+            return !list.some((s) => s.active === false) && rows[0].n >= 0;
+          })(),
+          'directory leaked inactive staff or extra fields'
+        );
+      }
+      // staff.manage stays owner-only; the directory must not have quietly
+      // opened the full staff list to every role.
+      const staffAsInv = await gql('{staff{id}}', inventory.token);
+      check(
+        '§3.3b the directory did not widen the full staff list to inventory',
+        codeOf(staffAsInv) === 'FORBIDDEN',
+        `${codeOf(staffAsInv)} ${msgOf(staffAsInv)}`
+      );
+      const dirAnon = await gql('{watumishi{id}}', null);
+      check('§3.3b the directory is not readable while signed out', codeOf(dirAnon) === 'UNAUTHENTICATED', codeOf(dirAnon));
+
+      // The composed request has to actually work end to end for the inventory
+      // clerk, which is the whole point of the panel.
+      const invReq = await gql(
+        `mutation{tumia_ombi(kwenda_kwa:1,ujumbe:"${PREFIX} tafadhali sukari"){id}}`,
+        inventory.token
+      );
+      const invReqId = invReq?.data?.tumia_ombi?.id;
+      created.ombi.push(invReqId);
+      check('§3.3b inventory clerk can send a request to the owner', Boolean(invReqId), msgOf(invReq));
+      const toSelf = await gql(
+        `mutation{tumia_ombi(kwenda_kwa:${inventory.id},ujumbe:"self"){id}}`,
+        inventory.token
+      );
+      check('§3.3b a request cannot be addressed to yourself', codeOf(toSelf) === 'BAD_REQUEST', `${codeOf(toSelf)} ${msgOf(toSelf)}`);
 
     // =====================================================================
     // Categories and bulk assignment

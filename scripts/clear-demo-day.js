@@ -52,8 +52,23 @@ async function main() {
     console.log(`  ${r.n} reminders`);
   }
 
-  await drop('kumbukumbu_matumizi', c.kumbukumbu, 'usage logs');
-  await drop('marekebisho_hisa', c.marekebisho, 'stock adjustments');
+    await drop('kumbukumbu_matumizi', c.kumbukumbu, 'usage logs');
+    await drop('marekebisho_hisa', c.marekebisho, 'stock adjustments');
+
+    // Low-stock reminders point at an ingredient rather than at an order, so the
+    // order sweep above cannot see them, and ukumbusho.malighafi_id has no
+    // cascade. Left in place they make the ingredient delete below fail on a
+    // foreign key, which is how this script used to stop half-finished with the
+    // day already torn apart. They are the forecast engine's output, not the
+    // seed's, so the manifest never lists them and they have to be swept by
+    // ingredient instead.
+    if ((c.malighafi || []).length) {
+      const [r] = await sql(
+        'WITH d AS (DELETE FROM ukumbusho WHERE malighafi_id = ANY($1::int[]) RETURNING 1) SELECT count(*)::int AS n FROM d',
+        [c.malighafi]
+      );
+      if (r.n) console.log(`  ${r.n} stock reminders`);
+    }
 
   // --- counter sales and their lines -------------------------------------
   // mauzo_bidhaa cascades from mauzo, so deleting the sales is enough.
@@ -93,12 +108,32 @@ async function main() {
   await drop('bidhaa', c.bidhaa, 'products');
   await drop('kategoria', c.kategoria, 'categories');
   await drop('mteja', c.mteja, 'customers');
-  // Only ingredients the seed actually created. Sukari and Unga predate it.
-  await drop('malighafi', c.malighafi, 'ingredients');
+    // Only ingredients the seed actually created. Sukari and Unga predate it.
+    await drop('malighafi', c.malighafi, 'ingredients');
 
-  console.log('\n  Left in place: reorder levels the seed set on pre-existing ingredients,');
-  console.log('  and the receipt number sequence, which has advanced for the day.');
-  console.log('  Stock levels now reflect only the ledger history that remains.\n');
+    // Put the pre-existing ingredients back to the levels they held before the
+    // seed opened a delivery against them. Ids in the manifest are not enough for
+    // this: the day's usage and restock rows are gone by now, so a balance that
+    // included both would settle higher than it started, and the next seed would
+    // inherit the drift.
+    const levels = (manifest.baselineLevels || {}).malighafi || [];
+    if (levels.length) {
+      const restored = await sql(
+        `UPDATE malighafi AS m
+            SET kiasi_kilichopo = b.kiasi_kilichopo::numeric,
+                kiwango_cha_chini = b.kiwango_cha_chini::numeric
+           FROM (SELECT * FROM jsonb_to_recordset($1::jsonb)
+                  AS (id int, kiasi_kilichopo text, kiwango_cha_chini text)) AS b
+          WHERE m.id = b.id
+          RETURNING m.id`,
+        [JSON.stringify(levels)]
+      );
+      console.log(`  ${restored.length} ingredient levels restored to their pre-seed values`);
+    }
+
+    console.log('\n  Left in place: the receipt number sequence, which has advanced for the day,');
+    console.log('  and any stock the shop has moved since the seed ran.');
+    console.log('  Pre-existing ingredient levels are put back as they were.\n');
 
   clearManifest();
 }

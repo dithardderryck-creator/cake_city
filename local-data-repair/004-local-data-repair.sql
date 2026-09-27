@@ -33,10 +33,11 @@ WHERE id = 2
   AND simu = (SELECT simu FROM mteja WHERE id = 1)
   AND NOT EXISTS (SELECT 1 FROM agizo_maalum WHERE mteja_id = 2);
 
--- A customer with no phone at all cannot be matched, so a partial index alone
--- would still let two blank-phone rows collide -- '' is not NULL.
-CREATE UNIQUE INDEX IF NOT EXISTS mteja_simu_uidx
-  ON mteja (simu) WHERE simu IS NOT NULL AND simu <> '';
+-- The one-customer-per-phone-number index that used to live here now lives in
+-- migrations/006_customer_and_order_notes.sql. Schema objects do not belong in a
+-- file that is deliberately never run on a fresh install: a new database was
+-- being created without the constraint. The merge above is the shop-specific
+-- part; the index is not.
 
 -- B2. Split family + size out of the free-text name FIRST.
 --

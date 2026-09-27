@@ -180,8 +180,12 @@ const insertUsageBatch = async (_, { agizo_id, kumbukumbu, vitu, malighafi_id, k
  * Validate + normalise a recipe's ingredient lines. Shared by create and
  * edit so both reject the same mistakes the same way.
  */
-const normaliseIngredients = async (client, viambato) => {
+const normaliseIngredients = async (client, viambato, allowEmpty = false) => {
   if (!Array.isArray(viambato) || !viambato.length) {
+    // A fraction_of recipe is meant to have no lines of its own — it inherits
+    // the parent's amounts, scaled. Requiring a line here made the whole
+    // fraction_of concept impossible to author, which is the bug this flag fixes.
+    if (allowEmpty) return [];
     throw new GraphQLError('Mapishi lazima iwe na angalau kifungu kimoja.', {
       extensions: { code: 'BAD_REQUEST' },
     });
@@ -225,6 +229,64 @@ const normaliseIngredients = async (client, viambato) => {
   return out;
 };
 
+/**
+ * Validates the own_recipe / fraction_of decision and returns the normalised
+ * values to persist. Shared by unda_mapishi and hariri_mapishi so the two
+ * paths cannot drift apart.
+ *
+ * `selfId` is the recipe being edited, used to stop a recipe being pointed at
+ * itself — the only cycle that is directly reachable from the form.
+ */
+const normaliseVariant = async (client, input, selfId = null) => {
+  const variant = (input.mapamba_variant || 'own_recipe').trim();
+  if (!['own_recipe', 'fraction_of'].includes(variant)) {
+    throw new GraphQLError('Aina ya mapishi si sahihi.', {
+      extensions: { code: 'BAD_REQUEST' },
+    });
+  }
+
+  if (variant !== 'fraction_of') {
+    // An own_recipe carries its own amounts, so a dangling parent or a stray
+    // ratio would be meaningless data. Clear both rather than storing them.
+    return { variant, mapishi_ibaba: null, sehemu_ya_uzito: null };
+  }
+
+  const parentId = Number(input.mapishi_ibaba);
+  if (!Number.isInteger(parentId) || parentId <= 0) {
+    throw new GraphQLError('Mapishi ya "sehemu ya" lazima ielekeze kwenye mapishi mzazi.', {
+      extensions: { code: 'BAD_REQUEST' },
+    });
+  }
+  if (selfId && parentId === Number(selfId)) {
+    throw new GraphQLError('Mapishi haiwezi kuwa mzazi yake mwenyewe.', {
+      extensions: { code: 'BAD_REQUEST' },
+    });
+  }
+
+  const ratio = Number(input.sehemu_ya_uzito);
+  if (!Number.isFinite(ratio) || ratio <= 0 || ratio >= 1) {
+    throw new GraphQLError('Sehemu ya uzito lazima uwe kati ya 0 na 1.', {
+      extensions: { code: 'BAD_REQUEST' },
+    });
+  }
+
+  const parent = (await client.query('SELECT id, mapamba_variant, active FROM mapishi WHERE id = $1', [parentId]))
+    .rows[0];
+  if (!parent) {
+    throw new GraphQLError('Mapishi mzazi halipo.', { extensions: { code: 'NOT_FOUND' } });
+  }
+  // No chains. A fraction of a fraction is still computable arithmetically, but
+  // allowing it lets a cycle be authored, and the parent-scaling read would then
+  // recurse with no base case.
+  if (parent.mapamba_variant !== 'own_recipe') {
+    throw new GraphQLError('Mapishi mzazi lazima iwe na mapishi yake yenyewe.', {
+      extensions: { code: 'BAD_REQUEST' },
+    });
+  }
+
+  return { variant, mapishi_ibaba: parentId, sehemu_ya_uzito: ratio };
+};
+
 const resolvers = {
   Date: DateScalar,
   DateTime: DateTimeScalar,
@@ -248,6 +310,19 @@ const resolvers = {
       ]);
       return rows[0] || null;
     },
+    // The kitchen's view of the customer. Gated on order.read_kitchen, not
+    // order.read_all, because the chef must see the allergy info but has no
+    // business seeing the rest of the customer record. Only the three columns
+    // the kitchen actually needs are selected.
+    mteja_kupika: async (order, _, ctx) => {
+      if (!can(ctx.user, 'order.read_kitchen')) return null;
+      if (!order.mteja_id) return null;
+      const { rows } = await pool.query(
+        'SELECT jina, simu, mzio FROM mteja WHERE id = $1',
+        [order.mteja_id]
+      );
+      return rows[0] || null;
+    },
     bei_jumla: (order, _, ctx) =>
       can(ctx.user, 'order.read_all') ? order.bei_jumla : null,
     malipo_ya_awali: (order, _, ctx) =>
@@ -257,6 +332,18 @@ const resolvers = {
     created_by: (order, _, ctx) =>
       can(ctx.user, 'order.read_all') ? order.created_by : null,
     muda_hitajika: async (order) => {
+      // A recipe-book order already carries a weighed prep time on the recipe
+      // itself, which is the kitchen-tested number. The free-text lookup below
+      // only knows the size ("24"), so it would hand back a generic default and
+      // quietly ignore the recipe the chef actually baked.
+      if (order.mapishi_id) {
+        const rec = (
+          await pool.query('SELECT dakika_kadirio FROM mapishi WHERE id = $1', [order.mapishi_id])
+        ).rows[0];
+        if (rec && Number.isFinite(Number(rec.dakika_kadirio))) {
+          return rec.dakika_kadirio;
+        }
+      }
       const prep = await getPrepTime(order.ladha, order.ukubwa);
       return prep;
     },
@@ -343,11 +430,36 @@ const resolvers = {
 
   Mapishi: {
     viambato: async (m) => {
-      const { rows } = await pool.query(
+      const own = await pool.query(
         'SELECT * FROM mapishi_kipengele WHERE mapishi_id = $1 ORDER BY id',
         [m.id]
       );
-      return rows;
+      if (own.rows.length > 0) return own.rows;
+
+      // A fraction_of recipe (a slice) has no lines of its own by design — it is
+      // a portion of the parent cake, not a separate recipe. Derive the amounts
+      // from the parent so the slice reports the real quantities the chef needs,
+      // rather than looking like an empty, broken recipe.
+      if (m.mapamba_variant === 'fraction_of' && m.mapishi_ibaba) {
+        const ratio = Number(m.sehemu_ya_uzito);
+        if (Number.isFinite(ratio) && ratio > 0) {
+          const parent = await pool.query(
+            'SELECT * FROM mapishi_kipengele WHERE mapishi_id = $1 ORDER BY id',
+            [m.mapishi_ibaba]
+          );
+          return parent.rows.map((r) => ({
+            ...r,
+            id: null,
+            mapishi_id: m.id,
+            inayotokwa: true,
+            kiasi_cha_chini: Number(r.kiasi_cha_chini) * ratio,
+            kiasi_cha_juu: Number(r.kiasi_cha_juu) * ratio,
+          }));
+        }
+      }
+      // An own_recipe that simply has nothing entered yet — an honest empty list,
+      // which the recipe form shows as "this recipe has no ingredients yet".
+      return own.rows;
     },
     mapishi_ibaba: async (m) => {
       if (!m.mapishi_ibaba) return null;
@@ -365,6 +477,10 @@ const resolvers = {
       ]);
       return rows[0] || null;
     },
+    // Stored lines are the recipe's own; a null id already signals "derived",
+    // but this makes the distinction explicit for the UI instead of requiring
+    // it to infer intent from a null.
+    inayotokwa: (line) => line.inayotokwa === true || line.id == null,
   },
 
   Ombi: {
@@ -902,9 +1018,22 @@ const resolvers = {
 
     ongeza_mteja: async (_, { input }, ctx) => {
       requireCan(ctx.user, 'customer.manage');
+      // Same phone, same person. The unique index on mteja(simu) is the
+      // backstop; catching it here turns a raw constraint violation into a
+      // message the cashier can act on.
+      const simu = (input.simu || '').trim();
+      if (simu) {
+        const existing = await pool.query('SELECT id, jina FROM mteja WHERE simu = $1', [simu]);
+        if (existing.rows[0]) {
+          throw new GraphQLError(
+            `Mteja "${existing.rows[0].jina}" tayari ana namba hiyo ya simu.`,
+            { extensions: { code: 'ALREADY_EXISTS', existing_id: existing.rows[0].id } }
+          );
+        }
+      }
       const { rows } = await pool.query(
-        'INSERT INTO mteja (jina, simu, siku_ya_kuzaliwa) VALUES ($1, $2, $3) RETURNING *',
-        [input.jina, input.simu || null, input.siku_ya_kuzaliwa || null]
+        'INSERT INTO mteja (jina, simu, mzio, siku_ya_kuzaliwa) VALUES ($1, $2, $3, $4) RETURNING *',
+        [input.jina, simu || null, (input.mzio || '').trim() || null, input.siku_ya_kuzaliwa || null]
       );
       return rows[0];
     },
@@ -984,10 +1113,37 @@ const resolvers = {
         await client.query('BEGIN');
         let mtejaId = input.mteja_id;
         let mtejaJina = input.mteja_mpya?.jina;
+        const simuMpya = (input.mteja_mpya?.simu || '').trim();
+        if (!mtejaId && simuMpya) {
+          // The same person ordering twice must not become two customer records
+          // with split history. A phone number identifies a person well enough
+          // to reuse the existing record, even if the name was typed slightly
+          // differently ("Asha" vs "Asha M.").
+          //
+          // The name and allergy info from the new input are only applied when
+          // they add something. Overwriting a recorded allergy with a blank
+          // field would quietly erase safety information.
+          const existing = (
+            await client.query('SELECT id, jina, mzio FROM mteja WHERE simu = $1', [simuMpya])
+          ).rows[0];
+          if (existing) {
+            mtejaId = existing.id;
+            mtejaJina = existing.jina;
+            const mzioMpya = (input.mteja_mpya.mzio || '').trim();
+            if (mzioMpya && mzioMpya !== existing.mzio) {
+              await client.query('UPDATE mteja SET mzio = $2 WHERE id = $1', [existing.id, mzioMpya]);
+            }
+          }
+        }
         if (!mtejaId && input.mteja_mpya) {
           const { rows } = await client.query(
-            'INSERT INTO mteja (jina, simu, siku_ya_kuzaliwa) VALUES ($1, $2, $3) RETURNING id',
-            [input.mteja_mpya.jina, input.mteja_mpya.simu || null, input.mteja_mpya.siku_ya_kuzaliwa || null]
+            'INSERT INTO mteja (jina, simu, mzio, siku_ya_kuzaliwa) VALUES ($1, $2, $3, $4) RETURNING id',
+            [
+              input.mteja_mpya.jina,
+              simuMpya || null,
+              (input.mteja_mpya.mzio || '').trim() || null,
+              input.mteja_mpya.siku_ya_kuzaliwa || null,
+            ]
           );
           mtejaId = rows[0].id;
         } else if (mtejaId) {
@@ -1010,22 +1166,24 @@ const resolvers = {
           }
           mapishiId = rec.id;
         }
-        const { rows } = await client.query(
-          `INSERT INTO agizo_maalum
-           (mteja_id, ladha, design, ukubwa, tarehe_ya_kuchukua, bei_jumla, malipo_ya_awali, hali, created_by, mapishi_id)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, 'ordered', $8, $9) RETURNING *`,
-          [
-            mtejaId,
-            input.ladha,
-            input.design || null,
-            input.ukubwa || null,
-            input.tarehe_ya_kuchukua,
-            input.bei_jumla,
-            malipo_ya_awali,
-            u.sub,
-            mapishiId,
-          ]
-        );
+          const { rows } = await client.query(
+            `INSERT INTO agizo_maalum
+             (mteja_id, ladha, design, ukubwa, tarehe_ya_kuchukua, bei_jumla, malipo_ya_awali, hali, created_by, mapishi_id, umbo, maelekezo_maalum)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 'ordered', $8, $9, $10, $11) RETURNING *`,
+            [
+              mtejaId,
+              input.ladha,
+              input.design || null,
+              input.ukubwa || null,
+              input.tarehe_ya_kuchukua,
+              input.bei_jumla,
+              malipo_ya_awali,
+              u.sub,
+              mapishiId,
+              (input.umbo || '').trim() || null,
+              (input.maelekezo_maalum || '').trim() || null,
+            ]
+          );
            const agizo = rows[0];
            const maelezo = `${agizo.ladha}${agizo.ukubwa ? ` — ${agizo.ukubwa}` : ''}`;
            const tikiti = await tikitishaAgizo(client, {
@@ -1279,7 +1437,8 @@ const resolvers = {
       const client = await pool.connect();
       try {
         await client.query('BEGIN');
-        const lines = await normaliseIngredients(client, input.viambato);
+        const v = await normaliseVariant(client, input);
+        const lines = await normaliseIngredients(client, input.viambato, v.variant === 'fraction_of');
 
         // mapishi has UNIQUE(ladha, ukubwa) across ALL rows including inactive
         // ones, so a soft-deleted recipe would otherwise permanently block
@@ -1297,19 +1456,19 @@ const resolvers = {
         if (prior) {
           await client.query(
             `UPDATE mapishi SET active = true, dakika_kadirio = $2, mapamba_variant = $3,
-                               mapishi_ibaba = $4, created_by = $5, created_at = now()
+                               mapishi_ibaba = $4, created_by = $5, sehemu_ya_uzito = $6, created_at = now()
               WHERE id = $1`,
-            [prior.id, input.dakika_kadirio || 90, input.mapamba_variant || 'own_recipe',
-             input.mapishi_ibaba || null, ctx.user.sub]
+            [prior.id, input.dakika_kadirio || 90, v.variant,
+             v.mapishi_ibaba, ctx.user.sub, v.sehemu_ya_uzito]
           );
           await client.query('DELETE FROM mapishi_kipengele WHERE mapishi_id = $1', [prior.id]);
           id = prior.id;
         } else {
           const ins = await client.query(
-            `INSERT INTO mapishi (ladha, ukubwa, dakika_kadirio, mapamba_variant, mapishi_ibaba, created_by)
-             VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
-            [ladha, ukubwa, input.dakika_kadirio || 90, input.mapamba_variant || 'own_recipe',
-             input.mapishi_ibaba || null, ctx.user.sub]
+            `INSERT INTO mapishi (ladha, ukubwa, dakika_kadirio, mapamba_variant, mapishi_ibaba, created_by, sehemu_ya_uzito)
+             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+            [ladha, ukubwa, input.dakika_kadirio || 90, v.variant,
+             v.mapishi_ibaba, ctx.user.sub, v.sehemu_ya_uzito]
           );
           id = ins.rows[0].id;
         }
@@ -1339,7 +1498,8 @@ const resolvers = {
         await client.query('BEGIN');
         const cur = (await client.query('SELECT * FROM mapishi WHERE id = $1 FOR UPDATE', [id])).rows[0];
         if (!cur) throw new GraphQLError('Mapishi halipo.', { extensions: { code: 'NOT_FOUND' } });
-        const lines = await normaliseIngredients(client, input.viambato);
+        const v = await normaliseVariant(client, input, id);
+        const lines = await normaliseIngredients(client, input.viambato, v.variant === 'fraction_of');
         const clash = (
           await client.query('SELECT id FROM mapishi WHERE ladha = $1 AND ukubwa = $2 AND id <> $3',
             [String(input.ladha || '').trim(), String(input.ukubwa || '').trim(), id])
@@ -1351,11 +1511,11 @@ const resolvers = {
         }
         await client.query(
           `UPDATE mapishi SET ladha = $2, ukubwa = $3, dakika_kadirio = $4,
-                              mapamba_variant = $5, mapishi_ibaba = $6
+                              mapamba_variant = $5, mapishi_ibaba = $6, sehemu_ya_uzito = $7
             WHERE id = $1`,
           [id, String(input.ladha || '').trim(), String(input.ukubwa || '').trim(),
-           input.dakika_kadirio || 90, input.mapamba_variant || 'own_recipe',
-           input.mapishi_ibaba || null]
+           input.dakika_kadirio || 90, v.variant,
+           v.mapishi_ibaba, v.sehemu_ya_uzito]
         );
         await client.query('DELETE FROM mapishi_kipengele WHERE mapishi_id = $1', [id]);
         for (const l of lines) {

@@ -58,6 +58,18 @@ async function main() {
   require('dotenv').config({ quiet: true });
   pool = require('../src/db/pool');
 
+  // The owner PIN is read from .env, never hardcoded. An earlier version of this
+  // file had the real PIN inlined, which put a live credential into git history
+  // and onto the remote.
+  const ownerPin = process.env.CAKE_OWNER_PIN;
+  if (!ownerPin) {
+    console.error('\nCAKE_OWNER_PIN is not set. Add it to .env before running this suite.\n');
+    process.exit(1);
+  }
+  // A throwaway PIN for the staff accounts this suite creates, so it never
+  // depends on -- or collides with -- anyone's real password.
+  const FIXTURE_PIN = 'vf7391';
+
   console.log(`\nVerifying fixes against ${BASE}\n`);
 
   // Reachability gate.
@@ -74,7 +86,7 @@ async function main() {
   // Log in FIRST, before any deliberate lockout test. The lockout is
   // per-account AND per-IP, so a failed-login test would otherwise lock this
   // very process out of every later check.
-  const good = await gql('mutation{login(id:1,pin:"1234"){token}}');
+  const good = await gql(`mutation{login(id:1,pin:"${ownerPin}"){token}}`);
   const ownerToken = good?.data?.login?.token;
   check('owner can log in', !!ownerToken, msgOf(good));
 
@@ -132,18 +144,34 @@ async function main() {
   check('D1 money-owed total matches the filter', Math.abs(Number(apiSum) - Number(directSum[0].s)) < 0.01, `api=${apiSum} sql=${directSum[0].s}`);
 
   // ---- C1/C2: validation rejects nonsense before the DB ----------------
+  // A throwaway product, so these checks do not depend on any particular
+  // product id existing. They used to hardcode bidhaa_id:1, which made the
+  // suite fail outright on a fresh install instead of testing the validation.
+  const mkProduct = await gql(
+    `mutation{bathi_bidhaa(input:{jina:"ZZ Verify Product C1",bei:1000,familia:"ZZVerify",ukubwa:"pcs"}){id}}`,
+    ownerToken
+  );
+  const c1ProductId = mkProduct?.data?.bathi_bidhaa?.id;
+  check('C1 fixture: throwaway product created', Boolean(c1ProductId), msgOf(mkProduct));
+
   // NjiaMalipo is a GraphQL enum, so its values are unquoted literals.
   const negQty = await gql(
-    `mutation{unda_mauzo(bidhaa:[{bidhaa_id:1,kiasi:-2}],njia_ya_malipo:cash){id}}`,
+    `mutation{unda_mauzo(bidhaa:[{bidhaa_id:${c1ProductId},kiasi:-2}],njia_ya_malipo:cash){id}}`,
     ownerToken
   );
   check('C1 negative line-item quantity rejected', codeOf(negQty) === 'BAD_REQUEST', `${codeOf(negQty)} ${msgOf(negQty)}`);
 
   const negDiscount = await gql(
-    `mutation{unda_mauzo(bidhaa:[{bidhaa_id:1,kiasi:1}],njia_ya_malipo:cash,punguzo:-500){id}}`,
+    `mutation{unda_mauzo(bidhaa:[{bidhaa_id:${c1ProductId},kiasi:1}],njia_ya_malipo:cash,punguzo:-500){id}}`,
     ownerToken
   );
   check('C1 negative discount rejected', codeOf(negDiscount) === 'BAD_REQUEST', `${codeOf(negDiscount)} ${msgOf(negDiscount)}`);
+
+  // Hard delete, not futa_bidhaa: that is a soft delete, so the row survives
+  // and the next run of this suite collides with the UNIQUE(familia, ukubwa)
+  // index and fails on its own leftovers. A throwaway fixture should leave
+  // nothing behind.
+  await sql('DELETE FROM bidhaa WHERE id = $1', [c1ProductId]);
 
   const depositTooBig = await gql(
     `mutation{unda_agizo(input:{ladha:"ZZTest",ukubwa:"ZZTest",tarehe_ya_kuchukua:"2030-01-01",bei_jumla:1000,malipo_ya_awali:5000}){id}}`,
@@ -234,10 +262,10 @@ async function main() {
 
   // ---- B4: a deactivated account loses access immediately ---------------
   // Jukumu is a GraphQL enum, so its value is an unquoted literal.
-  const chef = await gql('mutation{ongeza_mfanyakazi(jina:"ZZ Verify Chef",jukumu:chef,pin:"9999"){id}}', ownerToken);
+  const chef = await gql(`mutation{ongeza_mfanyakazi(jina:"ZZ Verify Chef",jukumu:chef,pin:"${FIXTURE_PIN}"){id}}`, ownerToken);
   const chefId = chef?.data?.ongeza_mfanyakazi?.id;
   check('fixture: new staff account created', !!chefId, msgOf(chef));
-  const chefLogin = chefId ? await gql(`mutation{login(id:${chefId},pin:"9999"){token}}`) : {};
+  const chefLogin = chefId ? await gql(`mutation{login(id:${chefId},pin:"${FIXTURE_PIN}"){token}}`) : {};
   const chefToken = chefLogin?.data?.login?.token;
   check('fixture: new staff can log in', !!chefToken, msgOf(chefLogin));
   const before = chefToken ? await gql('{hisa{items{id}}}', chefToken) : {};
@@ -248,14 +276,27 @@ async function main() {
   check('B4 deactivated token rejected immediately', codeOf(afterDeactivate) === 'UNAUTHENTICATED', `${codeOf(afterDeactivate)} ${msgOf(afterDeactivate)}`);
 
   // ---- G1: permission checks actually gate -----------------------------
-  const cashier = await sql(`SELECT id FROM mtumiaji WHERE jukumu='cashier' AND active=true LIMIT 1`);
-  if (cashier[0]) {
-    const cLogin = await gql(`mutation{login(id:${cashier[0].id},pin:"1234"){token}}`);
+  // This suite creates its own cashier. It used to look for any cashier already
+  // in the database, which meant the whole check was silently skipped on a
+  // fresh install — the one case where a broken permission check is most likely
+  // to go unnoticed.
+  const fixtureName = 'ZZ Verify Cashier G1';
+  await sql(`DELETE FROM mtumiaji WHERE jina = $1`, [fixtureName]);
+  const mkCashier = await gql(
+    `mutation{ongeza_mfanyakazi(jina:"${fixtureName}",jukumu:cashier,pin:"${FIXTURE_PIN}"){id}}`,
+    ownerToken
+  );
+  const cashierId = mkCashier?.data?.ongeza_mfanyakazi?.id;
+  check('G1 fixture: cashier created', Boolean(cashierId), msgOf(mkCashier));
+  if (cashierId) {
+    const cLogin = await gql(`mutation{login(id:${cashierId},pin:"${FIXTURE_PIN}"){token}}`);
     const cToken = cLogin?.data?.login?.token;
+    check('G1 fixture: cashier can log in', Boolean(cToken), msgOf(cLogin));
     if (cToken) {
       const forbidden = await gql('{marekebisho_hisa{id}}', cToken);
       check('G1 staff without permission get FORBIDDEN (not a dead-code fallthrough)', codeOf(forbidden) === 'FORBIDDEN', `${codeOf(forbidden)} ${msgOf(forbidden)}`);
     }
+    await sql(`DELETE FROM mtumiaji WHERE jina = $1`, [fixtureName]);
   }
   const unauth = await gql('{marekebisho_hisa{id}}');
   check('G1 anonymous caller gets UNAUTHENTICATED', codeOf(unauth) === 'UNAUTHENTICATED', codeOf(unauth));
@@ -296,18 +337,49 @@ async function main() {
 
   // ---- A1/K1: brute-force lockout. Runs LAST on purpose — it locks this
   // IP out by design, so no later check could authenticate.
+  //
+  // It locks a throwaway account rather than the real owner (id 1). Locking
+  // the owner would leave the running shop unable to log in after a test run,
+  // and would stop any other suite from authenticating until the server was
+  // restarted. The lockout is per-account AND per-IP, so a dedicated fixture
+  // still exercises the real per-IP throttle.
   console.log('\n  (lockout test runs last: it deliberately locks this IP out)');
+  const lockoutUser = await gql(
+    `mutation{ongeza_mfanyakazi(jina:"ZZ Verify Lockout",jukumu:cashier,pin:"${FIXTURE_PIN}"){id}}`,
+    ownerToken
+  );
+  const lockoutId = lockoutUser?.data?.ongeza_mfanyakazi?.id;
+  check('fixture: throwaway account for the lockout test', !!lockoutId, msgOf(lockoutUser));
+
   let lastFail = null;
-  for (let i = 0; i < 4; i += 1) lastFail = await gql('mutation{login(id:1,pin:"0000"){token}}');
+  for (let i = 0; i < 4; i += 1) lastFail = await gql(`mutation{login(id:${lockoutId},pin:"0000"){token}}`);
   check('A1 wrong PIN uses UNAUTHENTICATED, not UNAUTHORIZED', codeOf(lastFail) === 'UNAUTHENTICATED', codeOf(lastFail));
   check('A1 wrong PIN message is Kiswahili', /PIN/i.test(msgOf(lastFail)), msgOf(lastFail));
   check('A1 reports remaining attempts', /Majaribio 1/.test(msgOf(lastFail)), msgOf(lastFail));
 
-  const lockMsg = await gql('mutation{login(id:1,pin:"0000"){token}}');
+  const lockMsg = await gql(`mutation{login(id:${lockoutId},pin:"0000"){token}}`);
   check('A1 5th failure locks the account out', /umefungiwa/i.test(msgOf(lockMsg)), msgOf(lockMsg));
 
-  const correctButLocked = await gql('mutation{login(id:1,pin:"1234"){token}}');
+  const correctButLocked = await gql(`mutation{login(id:${lockoutId},pin:"${FIXTURE_PIN}"){token}}`);
   check('A1 correct PIN refused while locked out', codeOf(correctButLocked) === 'TOO_MANY_ATTEMPTS', `${codeOf(correctButLocked)} ${msgOf(correctButLocked)}`);
+
+  // The lockout is per-account AND per-IP, and the per-IP counter is what a
+  // real deployment relies on to stop one machine grinding many accounts. It
+  // therefore also blocks every other login from this address for the window,
+  // which no test can avoid. So the owner login is expected to fail here.
+  // What matters is that the throwaway account is what got locked, not the
+  // real owner, and that the state is in-memory and clears on restart.
+  const ownerDuring = await gql(`mutation{login(id:1,pin:"${ownerPin}"){token}}`);
+  check(
+    'A1 this IP is throttled by design after the lockout test',
+    codeOf(ownerDuring) === 'TOO_MANY_ATTEMPTS',
+    `${codeOf(ownerDuring)} ${msgOf(ownerDuring)}`
+  );
+  const ownerAccountIntact = await sql('SELECT active FROM mtumiaji WHERE id = 1');
+  check('A1 the real owner account itself is not locked', ownerAccountIntact[0]?.active === true);
+
+  await sql("DELETE FROM mtumiaji WHERE jina IN ('ZZ Verify Chef','ZZ Verify Lockout')");
+  console.log('  (lockout state is in-memory: restart the API before the next suite)');
 
   console.log(`\n${passed} passed, ${failed} failed\n`);
   if (failed > 0) {

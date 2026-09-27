@@ -239,7 +239,8 @@ function OrderTab() {
   const [undaaGizo] = useMutation(UNDA_AGIZO)
   const { data: mapishiData } = useQuery(MAPISHI)
   const [form, setForm] = useState({
-    jina: '', simu: '', ladha: '', design: '', ukubwa: '', mapishi_id: '', tarehe: '', bei: '', amali: '',
+    jina: '', simu: '', mzio: '', ladha: '', design: '', ukubwa: '', umbo: '',
+    maelekezo: '', mapishi_id: '', tarehe: '', bei: '', amali: '',
   })
   const [busy, setBusy] = useState(false)
   const [orderResult, setOrderResult] = useState(null)
@@ -271,10 +272,14 @@ function OrderTab() {
       const { data } = await undaaGizo({
         variables: {
           input: {
-            mteja_mpya: form.jina ? { jina: form.jina, simu: form.simu || undefined } : undefined,
+            mteja_mpya: form.jina
+              ? { jina: form.jina, simu: form.simu || undefined, mzio: form.mzio || undefined }
+              : undefined,
             ladha: form.ladha,
             design: form.design || undefined,
             ukubwa: form.ukubwa || undefined,
+            umbo: form.umbo || undefined,
+            maelekezo_maalum: form.maelekezo || undefined,
             mapishi_id: form.mapishi_id || null,
             tarehe_ya_kuchukua: form.tarehe,
             bei_jumla: Number(form.bei),
@@ -284,7 +289,10 @@ function OrderTab() {
         },
       })
       setOrderResult(data.unda_agizo)
-      setForm({ jina: '', simu: '', ladha: '', design: '', ukubwa: '', mapishi_id: '', tarehe: '', bei: '', amali: '' })
+      setForm({
+        jina: '', simu: '', mzio: '', ladha: '', design: '', ukubwa: '', umbo: '',
+        maelekezo: '', mapishi_id: '', tarehe: '', bei: '', amali: '',
+      })
       setPayMode('nusuri')
     } catch (err) {
       setOrderErr(err?.message || 'Agizo limeshindwa. Jaribu tena.')
@@ -309,10 +317,25 @@ function OrderTab() {
             <Field label="Jina la mteja" value={form.jina} onChange={(e) => update('jina', e.target.value)} placeholder="Jina (si lazima)" />
             <Field label="Simu" value={form.simu} onChange={(e) => update('simu', e.target.value)} placeholder="+255..." inputMode="tel" />
           </div>
-          <p className="cc-eyebrow mt-2 mb-1">Taarifa za Keki</p>
+          {/* A repeat customer is matched on the phone number, so this field is
+              carried to the next order. That makes an allergy typed here show up
+              automatically rather than depending on the cashier remembering it. */}
+          <div className="mt-3">
+            <Field
+              label="Mzio / Allergy"
+              value={form.mzio}
+              onChange={(e) => update('mzio', e.target.value)}
+              placeholder="Kama hakuna, acha tupu"
+            />
+          </div>
+          <p className="cc-eyebrow mt-4 mb-1">Taarifa za Keki</p>
           <div className="grid grid-cols-2 gap-3">
             <FieldSquare label="Ladha" required value={form.ladha} onChange={(e) => update('ladha', e.target.value)} placeholder="Choco, Vanilla..." />
             <FieldSquare label="Ukubwa" value={form.ukubwa} onChange={(e) => update('ukubwa', e.target.value)} placeholder="Small / Medium / Large" />
+          </div>
+          <div className="grid grid-cols-2 gap-3 mt-3">
+            <Field label="Umbo" value={form.umbo} onChange={(e) => update('umbo', e.target.value)} placeholder="Round, heart, square..." />
+            <Field label="Maelekezo maalum" value={form.maelekezo} onChange={(e) => update('maelekezo', e.target.value)} placeholder="Mafupi, rangi, ujumbe..." />
           </div>
           {/* Picking a recipe is what lets the kitchen prefill its tap sheet.
               It is optional: leave it blank and the order is treated as off-book. */}

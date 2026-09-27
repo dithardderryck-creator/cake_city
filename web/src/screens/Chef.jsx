@@ -211,12 +211,39 @@ export default function Chef() {
                         <span className="w-1.5 h-1.5 rounded-full bg-sage/60" /> Kuchukuliwa: {o.tarehe_ya_kuchukua}
                       </span>
                     </div>
-                    {o.design && (
-                      <p className="text-[11px] text-espresso-muted leading-relaxed max-w-[52ch] mb-3">
-                        <span className="font-medium text-espresso-muted">Muundo:</span> {o.design}
-                      </p>
-                    )}
-                    <StatusTimeline hali={o.hali} />
+                       {o.design && (
+                         <p className="text-[11px] text-espresso-muted leading-relaxed max-w-[52ch] mb-3">
+                           <span className="font-medium text-espresso-muted">Muundo:</span> {o.design}
+                         </p>
+                       )}
+                       {o.umbo && (
+                         <p className="text-[11px] text-espresso-muted leading-relaxed max-w-[52ch] mb-3">
+                           <span className="font-medium text-espresso-muted">Umbo:</span> {o.umbo}
+                         </p>
+                       )}
+                       {o.maelekezo_maalum && (
+                         <p className="text-[11px] text-espresso-muted leading-relaxed max-w-[52ch] mb-3">
+                           <span className="font-medium text-espresso-muted">Maelekezo:</span> {o.maelekezo_maalum}
+                         </p>
+                       )}
+                       {/* Allergy info is the one thing on this card that is not
+                           about the cake. It is deliberately the loudest element
+                           on the card: getting it wrong is a health incident, and
+                           it is recorded on the customer rather than the order, so
+                           it has to be re-read every time rather than assumed from
+                           the order. Placed above the fold, not behind a tap. */}
+                       {o.mteja_kupika?.mzio && (
+                         <div
+                           role="alert"
+                           className="flex items-start gap-2 rounded-lg border border-red-300 bg-red-50 px-3 py-2 mb-3"
+                         >
+                           <Warning weight="fill" className="w-4 h-4 text-red-600 shrink-0 mt-px" />
+                           <p className="text-[12px] font-semibold text-red-800 leading-snug">
+                             MZIO: {o.mteja_kupika.mzio}
+                           </p>
+                         </div>
+                       )}
+                       <StatusTimeline hali={o.hali} />
                   </div>
                 </div>
                 <div className="flex gap-2 pt-4 border-t border-hairline mt-4">

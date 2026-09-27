@@ -1,0 +1,31 @@
+What to achieve!:
+1.There four workers; cashier, chef, inventory & owner
+2.Owner owns and controls everything, 
+ puts goods for sale in the system
+ has the ability to check all sales done
+ oversees everything happening in the system
+ ability to add new staff and remove them and edit their details
+ can give orders to other staff to do something,
+    like they can issue to fetch more stock incase running low
+    fetch new ingredients
+    issue to chef to create a new product
+    
+3. a customer places an order from the cashier for a cake
+ those are special orders, they input their details including their 
+ allergy information and other necessities required
+ then there will be a layer that reads the order and then tries
+ to list the possible ingresients to be used while making it 
+ the chef sees the information abt the cake along with the possible ingredients to be used
+ but he can decide not to add his own or not use the listed ingredients
+ he logs every usage in ranges rather than whole numbers using a simple
+ fast "tap interractive" system then the inventory can come to get the specific numbers
+ of what was used so stock decrements there
+
+ inventory can also request new ingredients or propose for a restock to the owner
+
+ future feature i wanted to add was customers can use the cashoer device to create a 3D
+ model of their cake which the chef can see, also redesigning the chef's 
+ dashboard to suit him more is needed
+
+ i wanted to add another category of orders where customers order custom cakes
+ like diff shape and size and all those 

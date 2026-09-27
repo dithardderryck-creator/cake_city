@@ -12,8 +12,8 @@ export const UNDA_MAUZO = gql`
 export const UNDA_AGIZO = gql`
   mutation UndaAgizo($input: AgizoInput!) {
     unda_agizo(input: $input) {
-      id ladha ukubwa bei_jumla malipo_ya_awali salio hali
-      mteja { id jina simu }
+      id ladha ukubwa umbo maelekezo_maalum bei_jumla malipo_ya_awali salio hali
+      mteja { id jina simu mzio }
       tikiti { id namba tarehe aina hali jina maelezo jumla }
       malipo { id jumla njia_ya_malipo risiti_no }
     }

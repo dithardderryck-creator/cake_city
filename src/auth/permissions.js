@@ -47,10 +47,12 @@ const PERMISSIONS = {
     'stock.read': true,
     'product.read': true,
     'customer.manage': true,
-    // Cashiers can ask the kitchen for something, but cannot clear a request
-    // addressed to them unless they are the intended recipient — that check
-    // lives in the resolver, this only gates sending.
+    // Cashiers can ask the kitchen for something. Closing one is allowed here so
+    // that a request actually addressed to this cashier is not something only
+    // the owner can action — but the resolver still requires the caller to be
+    // the recipient (or the owner), so this flag is a gate, not the control.
     'ombi.tuma': true,
+    'ombi.fungua': true,
   },
   [ROLE_CHEF]: {
     'order.read_kitchen': true,
@@ -60,6 +62,10 @@ const PERMISSIONS = {
     'usage.create': true,
     'stock.read': true,
     'ombi.tuma': true,
+    // Same reasoning as the cashier: a chef told to "make a new product" is the
+    // one who can say it's done. The resolver's recipient check does the real
+    // work, so a chef still cannot close a request aimed at someone else.
+    'ombi.fungua': true,
   },
   [ROLE_INVENTORY]: {
     'usage.read_all': true,

@@ -8,20 +8,28 @@ export const WATEJA = gql`
   query Wateja($search: String) { wateja(search: $search) { id jina simu siku_ya_kuzaliwa } }
 `
 
+// The kitchen queue deliberately reads mteja_kupika, not mteja: allergy info is
+// safety-critical and must be on the card, but the chef has no order.read_all,
+// so mteja would resolve to null and the allergy would be silently hidden.
 export const ORDER_KWAJIKONI = gql`
-  query OrderKwajikoni {
-    order_kwajikoni {
-      id ladha design ukubwa tarehe_ya_kuchukua hali muda_hitajika
-      mapishi {
-        id ladha ukubwa dakika_kadirio
-        viambato {
-          id sehemu kiasi_cha_chini kiasi_cha_juu
-      malighafi { id jina unit kiasi_kilichopo }
+    query OrderKwajikoni {
+      order_kwajikoni {
+        id ladha design ukubwa tarehe_ya_kuchukua hali muda_hitajika
+        umbo
+        maelekezo_maalum
+        mteja_kupika {
+          jina simu mzio
+        }
+        mapishi {
+          id ladha ukubwa dakika_kadirio mapamba_variant
+          viambato {
+            id sehemu kiasi_cha_chini kiasi_cha_juu inayotokwa
+        malighafi { id jina unit kiasi_kilichopo }
+          }
         }
       }
     }
-  }
-`
+  `
 
 export const AGIZO_MAALUM = gql`
   query AgizoMaalum($hali: HaliOrder, $tarehe: Date) {

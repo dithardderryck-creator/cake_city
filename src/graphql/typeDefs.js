@@ -124,17 +124,22 @@ module.exports = gql`
     "own_recipe = its own weighed amounts. fraction_of = a portion of another cake (a slice), so it inherits rather than repeating."
     mapamba_variant: String!
     mapishi_ibaba: Mapishi
+    "For fraction_of recipes: the portion of the parent cake, as a ratio (0.10 = a tenth). Null for own_recipe."
+    sehemu_ya_uzito: Float
     viambato: [MapishiKipengele!]!
     created_at: DateTime
   }
 
   type MapishiKipengele {
-    id: ID!
+    "Null when this line is derived from a parent recipe rather than stored on this recipe."
+    id: ID
     malighafi: Malighafi!
     kiasi_cha_chini: Float!
     kiasi_cha_juu: Float!
     "Which part of the cake: mfuatano (base), krimu (frosting), ... A cake can use the same ingredient twice."
     sehemu: String!
+    "True when these amounts were scaled down from a fraction_of parent. Read-only: editing them here would silently change the whole cake."
+    inayotokwa: Boolean
   }
 
   "A request from one staff member to another. Distinct from Ukumbusho, which is computer-generated."
@@ -158,21 +163,36 @@ module.exports = gql`
     id: ID!
     jina: String!
     simu: String
+    "Allergy and dietary information for this person. It belongs to the customer, not the order, because it does not change between orders — and because the chef needs to see it every single time."
+    mzio: String
     siku_ya_kuzaliwa: Date
     created_at: DateTime
   }
 
+  "The customer as the kitchen sees them: who it is for, how to reach them, and their allergy info. Deliberately a separate, narrower type from Mteja."
+  type MtejaKupika {
+    jina: String
+    simu: String
+    mzio: String
+  }
+
   type AgizoMaalum {
-    id: ID!
-    mteja: Mteja
-    ladha: String!
+      id: ID!
+      mteja: Mteja
+      "What the kitchen needs to know about the person, and nothing more. Separate from the mteja field because the full customer record is gated behind order.read_all, which the chef does not have — so reading it through mteja would hand the chef a null and silently hide the allergy info."
+      mteja_kupika: MtejaKupika
+      ladha: String!
     design: String
     ukubwa: String
     "Optional: pick a recipe from the book so the kitchen's tap sheet starts prefilled. Omit it and the order is treated as off-book/custom."
-    mapishi_id: ID
-    "Set when the cake came from the recipe book. NULL means a custom/off-book order, which is the special-order flag."
-    mapishi: Mapishi
-    tarehe_ya_kuchukua: Date!
+      mapishi_id: ID
+      "Set when the cake came from the recipe book. NULL means a custom/off-book order, which is the special-order flag."
+      mapishi: Mapishi
+      "This order's shape, free text. One-off and creative by nature, so it is not a managed list."
+      umbo: String
+      "This order's special instructions: 'deliver by 3pm', 'extra decoration'. Changes every time, unlike the customer's allergy info on mteja.mzio."
+      maelekezo_maalum: String
+      tarehe_ya_kuchukua: Date!
       bei_jumla: Float
       malipo_ya_awali: Float
       salio: Float
@@ -365,6 +385,7 @@ module.exports = gql`
   input MtejaInput {
     jina: String!
     simu: String
+    mzio: String
     siku_ya_kuzaliwa: Date
   }
 
@@ -376,6 +397,8 @@ module.exports = gql`
       ukubwa: String
       "Optional: pick a recipe from the book so the kitchen's tap sheet starts prefilled. Omit it and the order is treated as off-book/custom."
       mapishi_id: ID
+      umbo: String
+      maelekezo_maalum: String
       tarehe_ya_kuchukua: Date!
       bei_jumla: Float!
       malipo_ya_awali: Float!
@@ -415,6 +438,8 @@ module.exports = gql`
     dakika_kadirio: Int
     mapamba_variant: String
     mapishi_ibaba: ID
+    "Required when mapamba_variant is fraction_of, and must be between 0 and 1 exclusive."
+    sehemu_ya_uzito: Float
     viambato: [MapishiKipengeleInput!]!
   }
 

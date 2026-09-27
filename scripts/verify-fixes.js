@@ -69,6 +69,9 @@ async function main() {
   // A throwaway PIN for the staff accounts this suite creates, so it never
   // depends on -- or collides with -- anyone's real password.
   const FIXTURE_PIN = 'vf7391';
+  // Shared by every throwaway product this suite creates. Cleanup finds the
+  // sales it made through this family rather than through receipt numbers.
+  const FIXTURE_FAMILY = 'ZZVerify';
 
   console.log(`\nVerifying fixes against ${BASE}\n`);
 
@@ -148,7 +151,7 @@ async function main() {
   // product id existing. They used to hardcode bidhaa_id:1, which made the
   // suite fail outright on a fresh install instead of testing the validation.
   const mkProduct = await gql(
-    `mutation{bathi_bidhaa(input:{jina:"ZZ Verify Product C1",bei:1000,familia:"ZZVerify",ukubwa:"pcs"}){id}}`,
+    `mutation{bathi_bidhaa(input:{jina:"ZZ Verify Product C1",bei:1000,familia:"${FIXTURE_FAMILY}",ukubwa:"pcs"}){id}}`,
     ownerToken
   );
   const c1ProductId = mkProduct?.data?.bathi_bidhaa?.id;
@@ -323,15 +326,32 @@ async function main() {
   await sql('DELETE FROM marekebisho_hisa WHERE malighafi_id=$1', [ingId]);
   await sql('DELETE FROM kumbukumbu_matumizi WHERE malighafi_id=$1', [ingId]);
   await sql('DELETE FROM malighafi WHERE id=$1', [ingId]);
-  await sql('DELETE FROM ukumbusho');
+  // Reminders are matched by what they point at, never table-wide. A bare
+  // DELETE FROM ukumbusho here would quietly discard the shop's real
+  // order reminders every time the suite was run.
+  await sql(
+    `DELETE FROM ukumbusho
+     WHERE agizo_id IN (SELECT id FROM agizo_maalum WHERE ladha = $1)
+        OR malighafi_id = $2`,
+    ['ZZTest', ingId]
+  );
   // Remove every fixture row by marker, children first, so the run is
   // repeatable regardless of how many fixtures a check needed.
   await sql(
     `DELETE FROM tikiti WHERE agizo_id IN (SELECT id FROM agizo_maalum WHERE ladha = $1)
-      OR mauzo_id IN (SELECT id FROM mauzo WHERE risiti_no LIKE $2)`,
-    ['ZZTest', 'RS-%']
+      OR mauzo_id IN (SELECT mb.mauzo_id FROM mauzo_bidhaa mb
+                      JOIN bidhaa b ON b.id = mb.bidhaa_id WHERE b.familia = $2)`,
+    ['ZZTest', FIXTURE_FAMILY]
   );
-  await sql('DELETE FROM mauzo WHERE risiti_no LIKE $1', ['RS-%']);
+  // Sales are matched through their own line items, never by receipt-number
+  // prefix. Retail receipts are generated as RS-<timestamp>-<rand>, so a
+  // LIKE 'RS-%' match is indistinguishable from real trading and would
+  // delete the shop's entire retail history on every test run.
+  await sql(
+    `DELETE FROM mauzo WHERE id IN (SELECT mb.mauzo_id FROM mauzo_bidhaa mb
+       JOIN bidhaa b ON b.id = mb.bidhaa_id WHERE b.familia = $1)`,
+    [FIXTURE_FAMILY]
+  );
   await sql('DELETE FROM agizo_maalum WHERE ladha=$1', ['ZZTest']);
   await sql("DELETE FROM mtumiaji WHERE jina='ZZ Verify Chef'");
 

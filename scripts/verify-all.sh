@@ -14,10 +14,37 @@ cd "$(dirname "$0")/.."
 API_PID=""
 LOG=/tmp/cakecity-verify-all.log
 
+# True when something is already listening on the API port. The suites need a
+# server nobody else is using, and the brute-force lockout check deliberately
+# trips the per-IP throttle inside whichever process serves them.
+port_in_use() {
+  lsof -nP -iTCP:4000 -sTCP:LISTEN >/dev/null 2>&1
+}
+
 start_api() {
+  # Refuse to start if the port is taken. Without this check the spawned server
+  # dies with EADDRINUSE, the health probe below is answered by whatever else
+  # owns the port, and the suites quietly run against that other process. The
+  # lockout test then throttles an IP in someone else's long-lived dev server,
+  # which locks the operator out of their own browser for 15 minutes and fails
+  # the next suite for a reason that has nothing to do with the code.
+  if port_in_use; then
+    echo "Port 4000 is already in use, so these suites cannot run." >&2
+    echo "Stop the other server first (an 'npm start' or 'npm run dev' you left" >&2
+    echo "running), then try again." >&2
+    return 1
+  fi
+
   node src/server.js >>"$LOG" 2>&1 &
   API_PID=$!
   for _ in $(seq 1 40); do
+    # A dead PID means the server exited — most likely a port clash that slipped
+    # past the check above. Report it instead of waiting out the full timeout.
+    if ! kill -0 "$API_PID" 2>/dev/null; then
+      echo "API exited during startup; see $LOG" >&2
+      API_PID=""
+      return 1
+    fi
     if curl -sf -o /dev/null http://localhost:4000/health; then return 0; fi
     sleep 0.5
   done
@@ -38,6 +65,20 @@ trap stop_api EXIT INT TERM
 
 : >"$LOG"
 status=0
+
+  # The pure unit suites come first because they need neither a database nor a
+  # server, so a broken band or state machine is reported in a second rather
+  # than after a minute of API and fixture work.
+  for suite in "node scripts/verify-matcher.js" "node scripts/verify-chef-and-requests.js"; do
+    echo ""
+    echo "=== $suite ==="
+    $suite
+    rc=$?
+    if [ $rc -ne 0 ]; then
+      status=$rc
+      echo "=== $suite FAILED ==="
+    fi
+  done
 
   for suite in verify verify:recipes; do
     echo ""

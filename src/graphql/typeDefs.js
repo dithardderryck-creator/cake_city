@@ -138,25 +138,114 @@ module.exports = gql`
     kiasi_cha_juu: Float!
     "Which part of the cake: mfuatano (base), krimu (frosting), ... A cake can use the same ingredient twice."
     sehemu: String!
-    "True when these amounts were scaled down from a fraction_of parent. Read-only: editing them here would silently change the whole cake."
+     "True when these amounts were scaled down from a fraction_of parent. Read-only: editing them here would silently change the whole cake."
     inayotokwa: Boolean
+     "The tappable amounts for this ingredient, derived from the min and max above. The chef picks one instead of typing a number."
+    vipendeleo: [MapishiKiasi!
+    ]!
   }
 
-  "A request from one staff member to another. Distinct from Ukumbusho, which is computer-generated."
-  type Ombi {
-    id: ID!
-    kutoka_kwa: Mtumiaji!
-    kwenda_kwa: Mtumiaji!
-    ujumbe: String!
-    hali: HaliOmbi!
-    jibu: String
-    tarehe_ya_kufunguliwa: DateTime
-    created_at: DateTime!
+     "One tappable amount. The alama says whether it is the range the recipe actually specifies, so the chef's normal choice is the obvious one."
+   type MapishiKiasi {
+    kiasi_cha_chini: Float!
+    kiasi_cha_juu: Float!
+    alama: MapishiKiasiAlama!
+  }
+
+   enum MapishiKiasiAlama {
+     "Below the recipe's range: the chef used less than suggested."
+    chini
+     "The range the recipe specifies. This is the tap a chef should make when the bake went to plan."
+    hasi
+     "Above the recipe's range: the chef used more than suggested."
+    juu
+  }
+
+  "A request from one staff member to another. Distinct from Ukumbusho, which is computer-generated. aina records which way the intent points: ombi asks for something, direktive instructs."
+  enum AinaUkumbushoKazi {
+    ombi
+    direktive
+  }
+
+  "chakati = whenever. kawaida = normal. haraka = today."
+  enum KipendeleoUkumbushoKazi {
+    chakati
+    kawaida
+    haraka
   }
 
   enum HaliOmbi {
+    "Written but not sent. Only the sender can see it."
+    imeandikwa
+    "Sent. Not yet picked up by the recipient."
+    imetumwa
+    "With the recipient, waiting on a decision."
+    inasubiri
+    "A directive that has been issued and is waiting to be acknowledged."
+    imeanzishwa
+    "The recipient has taken it on."
+    limekubaliwa
+    "Work is under way."
+    inaendelea
+    "Approved and now being carried out."
+    imeidhinishwa
+    "Refused. Terminal."
+    imekataa
+    "The recipient needs more information before deciding. The sender answers and resubmits."
+    inahitaji
+    "Finished. Terminal."
+    imekamilika
+    "Withdrawn. Terminal."
+    imeghairi
+    "Superseded by the upgrade in migration 008. Never produced by the current code."
     fungua
+    "Superseded by the upgrade in migration 008. Never produced by the current code."
     imefanyika
+  }
+
+  "The timeline of one request or directive: every state it has been through, who did it and when. Read back out of the audit log rather than kept in a second table, so it cannot fall out of step with what actually happened."
+  type IsharaOmbi {
+    hali: HaliOmbi!
+    tarehe: DateTime!
+    aliyefanya: Mtumiaji
+    ujumbe: String
+  }
+
+   type Ombi {
+    id: ID!
+    kutoka_kwa: Mtumiaji!
+    kwenda_kwa: Mtumiaji!
+    "The body of the request or directive."
+    ujumbe: String!
+    "A one-line summary. Separate from ujumbe so a list of twenty is readable."
+    mada: String
+    "Which direction this goes: asking, or instructing."
+    aina: AinaUkumbushoKazi!
+    kipendeleo: KipendeleoUkumbushoKazi!
+    "The ingredient this concerns, when it concerns one. A procurement request that names sugar in prose and links nothing cannot drive a reorder."
+    malighafi: Malighafi
+    "How much of it. Requires malighafi."
+    kiasi: Float
+    "The order this came out of, when it came out of one."
+    agizo: AgizoMaalum
+    "When this needs to be done by. Null means the owner did not set one."
+    mwisho: Date
+    "The recipient's role when this was sent, so the record still reads correctly after a role change or a staff deletion."
+    jukumu_anayehudumiwa: String
+    hali: HaliOmbi!
+    "The response or outcome."
+    jibu: String
+    "Who closed it, and when. A completed record with nobody on it is a record nobody did."
+    alizokamilisha_na: Mtumiaji
+    alizokamilisha_at: DateTime
+    tarehe_ya_kufunguliwa: DateTime
+    "True while the record is still waiting on someone."
+    hai: Boolean!
+    "Overdue: past mwisho and not yet finished."
+    imeishia_muda: Boolean!
+    "Every state this has been through, oldest first."
+    historia: [IsharaOmbi!]!
+    created_at: DateTime!
   }
 
   type Mteja {
@@ -181,11 +270,11 @@ module.exports = gql`
       mteja: Mteja
       "What the kitchen needs to know about the person, and nothing more. Separate from the mteja field because the full customer record is gated behind order.read_all, which the chef does not have — so reading it through mteja would hand the chef a null and silently hide the allergy info."
       mteja_kupika: MtejaKupika
-      ladha: String!
-    design: String
-    ukubwa: String
-    "Optional: pick a recipe from the book so the kitchen's tap sheet starts prefilled. Omit it and the order is treated as off-book/custom."
-      mapishi_id: ID
+     ladha: String!
+     design: String
+     ukubwa: String
+     "Owner only. Force a specific recipe when the matcher reads the order wrong. Omit it and the backend matches on ladha + ukubwa; an order nothing matches is recorded as off-book, which is a valid outcome."
+    mapishi_id: ID
       "Set when the cake came from the recipe book. NULL means a custom/off-book order, which is the special-order flag."
       mapishi: Mapishi
       "This order's shape, free text. One-off and creative by nature, so it is not a managed list."
@@ -286,12 +375,49 @@ module.exports = gql`
     mwenendo: [SikuHisa!]!
   }
 
-  type KumbukumbuMatumizi {
+     type ZingumiajiMatumizi {
     id: ID!
     agizo: AgizoMaalum
+    mpishi: Mtumiaji
+    "inakadiriwa = waiting on inventory. imethibitishwa = inventory confirmed the whole production event and stock moved."
+    hali: HaliUthibitishoMatumizi!
+    "The chef's lines. Empty only while the sheet is being written."
+    mistari: [KumbukumbuMatumizi!]!
+    kumbukumbu: String
+    tarehe: DateTime!
+    imethibitishwa_na: Mtumiaji
+    tarehe_ya_uthibitisho: DateTime
+    created_at: DateTime!
+  }
+
+     "What the chef decided about one ingredient. A sheet records a line for every ingredient the recipe listed, including the ones the chef did not use, because 'we left out the cocoa' is production information and its absence is not."
+   enum HaliSheeti {
+    "The chef tapped one of the recipe's suggested amounts."
+    imechaguliwa
+    "The chef looked at this ingredient and did not use it. Carries 0 and moves no stock."
+    haikutumika
+    "An ingredient the recipe did not list, which the chef added because the bake needed it."
+    nyingine
+  }
+
+     type KumbukumbuMatumizi {
+    id: ID!
+    agizo: AgizoMaalum
+    "The chef's submission this line belongs to. Null on rows written before sheets existed."
+    zingumiaji: ZingumiajiMatumizi
     malighafi: Malighafi!
-    "What the chef logged. Possibly mid-range. Never moves stock on its own."
+    "The midpoint of the band the chef tapped. Still only an estimate and still moves no stock on its own."
     kiasi: Float!
+    "Lower bound of the band the chef tapped. Null when the chef gave an exact number instead of picking a band."
+    kiasi_cha_chini: Float
+    "Upper bound of the band the chef tapped."
+    kiasi_cha_juu: Float
+    "What the chef decided about this line. Null on rows written before this existed."
+    hali_sheeti: HaliSheeti
+    "The recipe line this came from, so an extra ingredient can be told from a suggested one and a half-tuple from a full one."
+    mapishi_kipengele_id: ID
+    "Which part of the cake this was for, where the recipe uses the same ingredient twice."
+    sehemu: String
     mpishi: Mtumiaji
     tarehe: DateTime!
     "inakadiriwa = the chef's estimate, awaiting confirmation. imethibitishwa = inventory confirmed it and stock moved."
@@ -310,8 +436,12 @@ module.exports = gql`
   }
 
   enum HaliUthibitishoMatumizi {
+    "Waiting on inventory. The lines are estimates and nothing has moved yet."
     inakadiriwa
+    "Confirmed. This is the only state in which the lines have moved stock."
     imethibitishwa
+    "Replaced by a later submission before it was confirmed. Kept for the record, never queued, and it never moved stock."
+    imebadilishwa
   }
 
   type Malighafi {
@@ -383,6 +513,8 @@ module.exports = gql`
     mauzo(tarehe: Date, njia_ya_malipo: NjiaMalipo): [Mauzo!]!
     mauzo_ya_leo: [Mauzo!]!
     kumbukumbu_matumizi(agizo_id: ID, tarehe_kutoka: Date, tarehe_kutia: Date): [KumbukumbuMatumizi!]!
+    "The chef's own submissions, so a sheet already written is visible and cannot be written twice by accident."
+    zingumiaji_zangu: [ZingumiajiMatumizi!]!
     hisa: AllStock!
     "One ingredient with its real movement history, what the kitchen spends it on, and the daily balances behind them."
     maelezo_malighafi(id: ID!): MaelezoMalighafi
@@ -398,8 +530,8 @@ module.exports = gql`
     "Estimated usage awaiting inventory's confirmation. Stock has not moved for these yet."
     kumbukumbu_matumizi_kusubiri: [KumbukumbuMatumizi!]!
     kategoria(active: Boolean): [Kategoria!]!
-    "fungua: only open requests. Omit for everything."
-    ombi(fungua: Boolean): [Ombi!]!
+    "Everything you can see: records you sent, records addressed to you, and everything at all if you are the owner."
+    ombi(fungua: Boolean, aina: AinaUkumbushoKazi): [Ombi!]!
   }
 
   type Dashboard {
@@ -453,6 +585,20 @@ module.exports = gql`
     siku_ya_kuzaliwa: Date
   }
 
+  input OmbiInput {
+    "Who this is for."
+    kwenda_kwa: ID!
+    aina: AinaUkumbushoKazi
+    kipendeleo: KipendeleoUkumbushoKazi
+    mada: String
+    ujumbe: String!
+    "Link the ingredient this concerns. Without it a procurement request is just prose."
+    malighafi_id: ID
+    kiasi: Float
+    agizo_id: ID
+    mwisho: Date
+  }
+
     input AgizoInput {
       mteja_id: ID
       mteja_mpya: MtejaInput
@@ -479,7 +625,16 @@ module.exports = gql`
 
   input MatumiziKipengeleInput {
     malighafi_id: ID!
-    kiasi: Float!
+    kiasi: Float
+    "The band the chef tapped, lower bound. Send it instead of kiasi so the sheet records what the chef chose rather than a number derived from it."
+    kiasi_cha_chini: Float
+    "Upper bound of the tapped band."
+    kiasi_cha_juu: Float
+    "Set when the chef marked this ingredient as not used, or added it themselves. Null means the chef tapped an amount."
+    hali_sheeti: HaliSheeti
+    "The recipe line this came from. Lets the same ingredient appear twice, once for the base and once for the frosting."
+    mapishi_kipengele_id: ID
+    sehemu: String
   }
 
   "One tap-submit of many ingredients. agizo_id is OPTIONAL: regular shop production has no order, so kumbukumbu (e.g. '20 mandazi') is what explains the entry."
@@ -487,6 +642,8 @@ module.exports = gql`
     agizo_id: ID
     kumbukumbu: String
     vitu: [MatumiziKipengeleInput!]!
+    "Replace an existing open sheet for this order instead of refusing. The old one is kept for the record; this is how a chef corrects a submission inventory has not confirmed yet."
+    badilisha: Boolean
   }
 
   input MapishiKipengeleInput {
@@ -551,10 +708,14 @@ module.exports = gql`
     "Bulk action: move many products into one category at once."
     panga_kategoria(bidhaa_ids: [ID!]!, kategoria_id: ID!): Int!
 
-    "Ask another member of staff for something. Does not move stock."
-    tumia_ombi(kwenda_kwa: ID!, ujumbe: String!): Ombi!
-    "Clear a request. Only the person it was addressed to may do this."
-    fungua_ombi(id: ID!, jibu: String): Ombi!
+    "Raise a request or issue a directive. The direction is the only difference: an ombi asks, a direktive instructs. Starts in imeandikwa so it can be corrected before anybody is told."
+    tuma_ombi(input: OmbiInput!): Ombi!
+    "Move a request or directive to its next state. The backend decides which states are reachable and refuses the rest, so a client cannot jump a record from 'sent' to 'completed'."
+    sasisha_ombi(id: ID!, hali: HaliOmbi!, jibu: String): Ombi!
+    "Close out finished work. Records who did it and when."
+    kamilisha_ombi(id: ID!, jibu: String): Ombi!
+    "Withdraw a record that has not been finished."
+    ghairi_ombi(id: ID!, sababu: String): Ombi!
 
     marekebisho_hisa(input: MarekebishoInput!): MarekebishoHisa!
     ongeza_mfanyakazi(jina: String!, jukumu: Jukumu!, pin: String!): Mtumiaji!

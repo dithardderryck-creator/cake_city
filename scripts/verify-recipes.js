@@ -138,6 +138,14 @@ async function purgeStrays() {
 
 const near = (a, b, eps = 1e-6) => Math.abs(Number(a) - Number(b)) < eps;
 
+// The states that mean "still waiting on somebody". Kept here rather than
+// imported from the state machine so that the filter tests assert what a user
+// would call open, not whatever the module happens to define.
+const openListStates = new Set([
+  'imeandikwa', 'imetumwa', 'inasubiri', 'inahitaji', 'imeidhinishwa',
+  'imeanzishwa', 'limekubaliwa', 'inaendelea',
+]);
+
 /**
  * Refuses to delete a row the suite did not create.
  *
@@ -558,38 +566,126 @@ async function main() {
     for (const target of [chef, cashier]) {
       const label = target.jukumu;
       const sent = await gql(
-        `mutation{tumia_ombi(kwenda_kwa:${target.id},ujumbe:"${PREFIX} tafadhali ${label}"){id kwenda_kwa{id} hali}}`,
+        `mutation{tuma_ombi(input:{kwenda_kwa:${target.id},ujumbe:"${PREFIX} tafadhali ${label}"}){id kwenda_kwa{id} hali}}`,
         ownerToken
       );
-      const ombiId = sent?.data?.tumia_ombi?.id;
+      const ombiId = sent?.data?.tuma_ombi?.id;
       created.ombi.push(ombiId);
       check(`§3.3 ${label} can be sent a request`, Boolean(ombiId), msgOf(sent));
+      check(
+        `§3.3 ${label}'s request starts written, not sent`,
+        sent?.data?.tuma_ombi?.hali === 'imeandikwa',
+        sent?.data?.tuma_ombi?.hali
+      );
+
+      // The record has to be sent before anybody is on the hook for it, and
+      // picking it up is not the same as answering it.
+      const skipped = await gql(
+        `mutation{sasisha_ombi(id:${ombiId},hali:imekamilika){id}}`,
+        target.token
+      );
+      check(
+        `§3.3 ${label}'s request cannot jump straight to done`,
+        ['INVALID_TRANSITION', 'FORBIDDEN'].includes(codeOf(skipped)),
+        `${codeOf(skipped)} ${msgOf(skipped)}`
+      );
+
+      const sent2 = await gql(`mutation{sasisha_ombi(id:${ombiId},hali:imetumwa){hali}}`, ownerToken);
+      check(`§3.3 ${label}'s request can be sent`, sent2?.data?.sasisha_ombi?.hali === 'imetumwa', msgOf(sent2));
 
       // The wrong person must still be refused — this is the control that
       // makes the widened permission in §3.3 safe. Only meaningful when the
       // chef is NOT the recipient; running it otherwise would have the chef
-      // close their own request and make the real check below fail.
+      // answer their own request and make the real check below fail.
       if (String(target.id) !== String(chef.id)) {
-        const wrong = await gql(`mutation{fungua_ombi(id:${ombiId},jibu:"not mine"){id}}`, chef.token);
-        check(`§3.3 ${label}'s request cannot be closed by the chef`, codeOf(wrong) === 'FORBIDDEN', `${codeOf(wrong)} ${msgOf(wrong)}`);
+        const wrong = await gql(`mutation{sasisha_ombi(id:${ombiId},hali:inasubiri,jibu:"not mine"){id}}`, chef.token);
+        check(`§3.3 ${label}'s request cannot be picked up by the chef`, codeOf(wrong) === 'FORBIDDEN', `${codeOf(wrong)} ${msgOf(wrong)}`);
       }
 
-      const closed = await gql(`mutation{fungua_ombi(id:${ombiId},jibu:"imefanyika"){id hali jibu}}`, target.token);
+      const picked = await gql(`mutation{sasisha_ombi(id:${ombiId},hali:inasubiri){hali}}`, target.token);
       check(
-        `§3.3 ${label} can close a request addressed to them`,
-        closed?.data?.fungua_ombi?.hali === 'imefanyika',
-        `${codeOf(closed)} ${msgOf(closed)}`
+        `§3.3 ${label} can pick up a request addressed to them`,
+        picked?.data?.sasisha_ombi?.hali === 'inasubiri',
+        `${codeOf(picked)} ${msgOf(picked)}`
       );
 
-      const again = await gql(`mutation{fungua_ombi(id:${ombiId},jibu:"tena"){id}}`, target.token);
-      check(`§3.3 ${label} cannot double-close`, codeOf(again) === 'ALREADY_CLOSED', `${codeOf(again)} ${msgOf(again)}`);
+      // The owner sent every request in this block, and the owner is still the
+      // person who sent it. If the owner can approve their own request then the
+      // approval step is a signature, not a decision, so this is checked
+      // deliberately and not as an afterthought.
+      const selfApprove = await gql(
+        `mutation{sasisha_ombi(id:${ombiId},hali:imeidhinishwa,jibu:"mine"){id}}`,
+        ownerToken
+      );
+      check(
+        '§3.3 the sender cannot approve their own request, even as owner',
+        codeOf(selfApprove) === 'FORBIDDEN',
+        `${codeOf(selfApprove)} ${msgOf(selfApprove)}`
+      );
+
+      const approved = await gql(
+        `mutation{sasisha_ombi(id:${ombiId},hali:imeidhinishwa,jibu:"nakubali"){hali}}`,
+        target.token
+      );
+      check(
+        `§3.3 ${label} can approve a request addressed to them`,
+        approved?.data?.sasisha_ombi?.hali === 'imeidhinishwa',
+        `${codeOf(approved)} ${msgOf(approved)}`
+      );
+
+      const done = await gql(`mutation{sasisha_ombi(id:${ombiId},hali:imekamilika,jibu:"imefanyika"){hali jibu}}`, target.token);
+      check(
+        `§3.3 ${label} can complete an approved request`,
+        done?.data?.sasisha_ombi?.hali === 'imekamilika',
+        `${codeOf(done)} ${msgOf(done)}`
+      );
+
+      const again = await gql(`mutation{sasisha_ombi(id:${ombiId},hali:inaendelea){id}}`, target.token);
+      check(`§3.3 ${label} cannot move a closed request`, ['ALREADY_CLOSED', 'INVALID_TRANSITION'].includes(codeOf(again)), `${codeOf(again)} ${msgOf(again)}`);
     }
 
-      // The owner can still close anything.
-      const toChef = await gql(`mutation{tumia_ombi(kwenda_kwa:${chef.id},ujumbe:"${PREFIX} owner close"){id}}`, ownerToken);
-      created.ombi.push(toChef?.data?.tumia_ombi?.id);
-      const ownerClose = await gql(`mutation{fungua_ombi(id:${toChef?.data?.tumia_ombi?.id},jibu:"na owner"){hali}}`, ownerToken);
-      check('§3.3 owner can still close any request', ownerClose?.data?.fungua_ombi?.hali === 'imefanyika', msgOf(ownerClose));
+    // A stranger can neither answer nor close a record that is not theirs.
+    {
+      const toChef = await gql(
+        `mutation{tuma_ombi(input:{kwenda_kwa:${chef.id},ujumbe:"${PREFIX} owner close",aina:direktive}){id aina}}`,
+        ownerToken
+      );
+      created.ombi.push(toChef?.data?.tuma_ombi?.id);
+      check('§3.3 a directive records which way it points', toChef?.data?.tuma_ombi?.aina === 'direktive', msgOf(toChef));
+      const issued = await gql(
+        `mutation{sasisha_ombi(id:${toChef?.data?.tuma_ombi?.id},hali:imetumwa){hali}}`,
+        ownerToken
+      );
+      check('§3.3 a written directive can be sent', issued?.data?.sasisha_ombi?.hali === 'imetumwa', msgOf(issued));
+      const ownerAck = await gql(
+        `mutation{sasisha_ombi(id:${toChef?.data?.tuma_ombi?.id},hali:imeanzishwa){hali}}`,
+        ownerToken
+      );
+      check('§3.3 a directive can be issued', ownerAck?.data?.sasisha_ombi?.hali === 'imeanzishwa', msgOf(ownerAck));
+      const ownerSelfAck = await gql(
+        `mutation{sasisha_ombi(id:${toChef?.data?.tuma_ombi?.id},hali:limekubaliwa){hali}}`,
+        ownerToken
+      );
+      check(
+        '§3.3 the issuer cannot acknowledge a directive for the person it was sent to',
+        codeOf(ownerSelfAck) === 'FORBIDDEN',
+        `${codeOf(ownerSelfAck)} ${msgOf(ownerSelfAck)}`
+      );
+      const cashAck = await gql(
+        `mutation{sasisha_ombi(id:${toChef?.data?.tuma_ombi?.id},hali:limekubaliwa){hali}}`,
+        cashier.token
+      );
+      check(
+        '§3.3 somebody unrelated cannot acknowledge a directive',
+        codeOf(cashAck) === 'FORBIDDEN',
+        `${codeOf(cashAck)} ${msgOf(cashAck)}`
+      );
+      const chefAck = await gql(
+        `mutation{sasisha_ombi(id:${toChef?.data?.tuma_ombi?.id},hali:limekubaliwa){hali}}`,
+        chef.token
+      );
+      check('§3.3 the recipient can acknowledge a directive', chefAck?.data?.sasisha_ombi?.hali === 'limekubaliwa', msgOf(chefAck));
+    }
 
       // =====================================================================
       // §3.3b — the request composer needs a list of colleagues
@@ -638,14 +734,14 @@ async function main() {
       // The composed request has to actually work end to end for the inventory
       // clerk, which is the whole point of the panel.
       const invReq = await gql(
-        `mutation{tumia_ombi(kwenda_kwa:1,ujumbe:"${PREFIX} tafadhali sukari"){id}}`,
+        `mutation{tuma_ombi(input:{kwenda_kwa:1,ujumbe:"${PREFIX} tafadhali sukari"}){id}}`,
         inventory.token
       );
-      const invReqId = invReq?.data?.tumia_ombi?.id;
+      const invReqId = invReq?.data?.tuma_ombi?.id;
       created.ombi.push(invReqId);
       check('§3.3b inventory clerk can send a request to the owner', Boolean(invReqId), msgOf(invReq));
       const toSelf = await gql(
-        `mutation{tumia_ombi(kwenda_kwa:${inventory.id},ujumbe:"self"){id}}`,
+        `mutation{tuma_ombi(input:{kwenda_kwa:${inventory.id},ujumbe:"self"}){id}}`,
         inventory.token
       );
       check('§3.3b a request cannot be addressed to yourself', codeOf(toSelf) === 'BAD_REQUEST', `${codeOf(toSelf)} ${msgOf(toSelf)}`);
@@ -722,6 +818,214 @@ async function main() {
     check('verifying more than we had is allowed, not an error', overVerified?.data?.thibitisha_matumizi?.hali === 'imethibitishwa', msgOf(overVerified));
     const negStock = await sql('SELECT kiasi_kilichopo FROM malighafi WHERE id = $1', [sugar.id]);
     check('over-usage leaves negative stock as the signal', Number(negStock[0].kiasi_kilichopo) < 0, `stock=${negStock[0].kiasi_kilichopo}`);
+
+    // =====================================================================
+    // A chef sheet references the recipe lines it came from
+    // =====================================================================
+    // The sheet path was not covered here at all, and the database trigger that
+    // guards it was comparing a recipe line's quantity against an ingredient id,
+    // so a valid sheet could not be saved. The wrong-ingredient case is the
+    // reason the trigger exists, so it is checked from both sides.
+    console.log('\n  -- chef sheet lines --');
+    const recipeLine = await sql('SELECT id, malighafi_id, sehemu FROM mapishi_kipengele WHERE mapishi_id = $1 ORDER BY id', [parentId]);
+    const lineA = recipeLine[0];
+    // Any ingredient other than the one lineA names. Worked out rather than
+    // assumed, so this does not depend on how many lines the fixture recipe has.
+    const otherId = [flour.id, sugar.id].find((x) => String(x) !== String(lineA?.malighafi_id));
+
+    const sheetOk = await gql(
+      `mutation{log_matumizi_kundi(input:{kumbukumbu:"${PREFIX} sheet",
+         vitu:[
+           {malighafi_id:${lineA.malighafi_id},kiasi_cha_chini:1,kiasi_cha_juu:1.2,mapishi_kipengele_id:${lineA.id},hali_sheeti:imechaguliwa}
+         ]}){id hali}}`,
+      chef.token
+    );
+    const sheetIds = sheetOk?.data?.log_matumizi_kundi || [];
+    check('a sheet line pointing at a real recipe line is accepted', sheetIds.length === 1, msgOf(sheetOk));
+
+    const sheetLine = sheetIds.length
+      ? (await sql('SELECT sehemu, malighafi_id, mapishi_kipengele_id FROM kumbukumbu_matumizi WHERE id = $1', [sheetIds[0].id]))[0]
+      : null;
+    check(
+      'the section is taken from the recipe, not from the client',
+      sheetLine?.sehemu === lineA.sehemu,
+      `sheet=${sheetLine?.sehemu} recipe=${lineA.sehemu}`
+    );
+    check(
+      'a sheet line keeps its link to the recipe line',
+      String(sheetLine?.mapishi_kipengele_id) === String(lineA.id),
+      JSON.stringify(sheetLine)
+    );
+
+    // The same ingredient on two different recipe lines is the reason the
+    // per-ingredient uniqueness rule was dropped in migration 009.
+    const twiceCheck = await sql('SELECT count(*)::int n FROM mapishi_kipengele WHERE mapishi_id = $1 AND malighafi_id = $2', [parentId, lineA.malighafi_id]);
+    check('the recipe has one line per ingredient, so duplicates are only visible elsewhere', twiceCheck[0].n >= 1, twiceCheck[0].n);
+
+    const wrongIngredient = await gql(
+      `mutation{log_matumizi_kundi(input:{kumbukumbu:"${PREFIX} wrong",
+         vitu:[
+           {malighafi_id:${otherId},kiasi_cha_chini:1,kiasi_cha_juu:1.2,mapishi_kipengele_id:${lineA.id},hali_sheeti:imechaguliwa}
+         ]}){id}}`,
+      chef.token
+    );
+    check(
+      'a sheet line cannot claim a different ingredient than the recipe line it points at',
+      codeOf(wrongIngredient) === 'CHECK_VIOLATION' || codeOf(wrongIngredient) === 'BAD_REQUEST' || codeOf(wrongIngredient) === 'GRAPHQL_VALIDATION_FAILED',
+      `${codeOf(wrongIngredient)} ${msgOf(wrongIngredient)}`
+    );
+
+    // The sheet for an order may only be built from that order's recipe.
+    const foreignRecipe = await sql("SELECT id FROM mapishi WHERE id <> $1 AND active ORDER BY id LIMIT 1", [parentId]);
+    if (foreignRecipe.length) {
+      const foreignLines = await sql('SELECT id, malighafi_id FROM mapishi_kipengele WHERE mapishi_id = $1 ORDER BY id LIMIT 1', [foreignRecipe[0].id]);
+      if (foreignLines.length) {
+        const strayRef = await gql(
+          `mutation{log_matumizi_kundi(input:{agizo_id:${orderId},
+             vitu:[{malighafi_id:${foreignLines[0].malighafi_id},kiasi_cha_chini:1,kiasi_cha_juu:1.2,
+                    mapishi_kipengele_id:${foreignLines[0].id},hali_sheeti:imechaguliwa}]}){id}}`,
+          chef.token
+        );
+        check(
+          "a sheet for an order cannot be built from another recipe's line",
+          codeOf(strayRef) === 'BAD_REQUEST',
+          `${codeOf(strayRef)} ${msgOf(strayRef)}`
+        );
+      }
+    }
+
+    // =====================================================================
+    // A correction keeps the sheet it replaces
+    // =====================================================================
+    // The amend path used to detach the old lines and delete the old sheet, which
+    // is the opposite of what the field promises and erases the submission being
+    // corrected. The replacement is a new open sheet and the old one is superseded.
+    console.log('\n  -- amending a sheet --');
+
+    // The order was placed against slowId, so everything below is built from
+    // slowId's own lines. A line from another recipe is refused by the ownership
+    // check, and it is right to refuse it.
+    const orderLines = await sql('SELECT id, malighafi_id FROM mapishi_kipengele WHERE mapishi_id = $1 ORDER BY id', [slowId]);
+    const orderLine = orderLines[0];
+    const tapFor = (min, max) =>
+      `{malighafi_id:${orderLine.malighafi_id},kiasi_cha_chini:${min},kiasi_cha_juu:${max},mapishi_kipengele_id:${orderLine.id},hali_sheeti:imechaguliwa}`;
+
+    const sheetFirst = await gql(
+      `mutation{log_matumizi_kundi(input:{agizo_id:${orderId},
+         vitu:[${tapFor(1, 1.2)}]}){id}}`,
+      chef.token
+    );
+    const sheetFirstLineId = (sheetFirst?.data?.log_matumizi_kundi || [])[0]?.id;
+    const sheetFirstSheetId = sheetFirstLineId
+      ? (await sql('SELECT zingumiaji_id FROM kumbukumbu_matumizi WHERE id = $1', [sheetFirstLineId]))[0].zingumiaji_id
+      : null;
+    check('the order accepts a sheet', Boolean(sheetFirstLineId), msgOf(sheetFirst));
+    check('a sheet for an order is recorded against the order', Boolean(sheetFirstSheetId), 'no sheet was created');
+
+    const sheetAgain = await gql(
+      `mutation{log_matumizi_kundi(input:{agizo_id:${orderId},
+         vitu:[${tapFor(1, 1.2)}]}){id}}`,
+      chef.token
+    );
+    check('an order already logged cannot be logged sheetAgain', codeOf(sheetAgain) === 'ALREADY_LOGGED', `${codeOf(sheetAgain)} ${msgOf(sheetAgain)}`);
+
+    const sheetAmended = await gql(
+      `mutation{log_matumizi_kundi(input:{agizo_id:${orderId},badilisha:true,
+         vitu:[${tapFor(2, 2.4)}]}){id}}`,
+      chef.token
+    );
+    const amendLineId = (sheetAmended?.data?.log_matumizi_kundi || [])[0]?.id;
+    check('a correction is accepted', Boolean(amendLineId), msgOf(sheetAmended));
+
+    const keptSheet = sheetFirstSheetId
+      ? (await sql('SELECT hali FROM zingumiaji_matumizi WHERE id = $1', [sheetFirstSheetId]))[0]
+      : null;
+    check('the replaced sheet is still on the record', Boolean(keptSheet), 'the old sheet was deleted');
+    check('the replaced sheet is marked superseded', keptSheet?.hali === 'imebadilishwa', keptSheet?.hali);
+
+    const keptLine = sheetFirstLineId
+      ? (await sql('SELECT kiasi, hali_sheeti, zingumiaji_id FROM kumbukumbu_matumizi WHERE id = $1', [sheetFirstLineId]))[0]
+      : null;
+    check('the replaced sheet keeps the amount the chef sheetFirst tapped', near(keptLine?.kiasi, 1.1), JSON.stringify(keptLine));
+    check('the replaced line still belongs to the sheet it was written on', String(keptLine?.zingumiaji_id) === String(sheetFirstSheetId), JSON.stringify(keptLine));
+
+    const amendSheetId = amendLineId
+      ? (await sql('SELECT zingumiaji_id FROM kumbukumbu_matumizi WHERE id = $1', [amendLineId]))[0].zingumiaji_id
+      : null;
+    check('the correction is on a sheet of its own', amendSheetId && amendSheetId !== sheetFirstSheetId, `sheetAmended=${amendSheetId} sheetFirst=${sheetFirstSheetId}`);
+
+    const amendQueueRes = await gql(
+      `query{kumbukumbu_matumizi_kusubiri{id zingumiaji{hali}}}`,
+      ownerToken
+    );
+    const amendQueued = amendQueueRes?.data?.kumbukumbu_matumizi_kusubiri || [];
+    check(
+      'a superseded sheet is not left in the verification queue',
+      amendQueued.every((l) => !l.zingumiaji || l.zingumiaji.hali === 'inakadiriwa'),
+      JSON.stringify(amendQueued.map((l) => l.zingumiaji && l.zingumiaji.hali))
+    );
+    check('the correction is waiting to be verified', amendQueued.some((l) => l.id === amendLineId), 'the replacement sheet is not amendQueued');
+    check('the superseded sheet is not waiting to be verified', !amendQueued.some((l) => l.id === sheetFirstLineId), 'the replaced line is still amendQueued');
+
+    // A "not used" answer is stored as zero, which is what inventory confirms and
+    // which moves no stock. hali_sheeti itself is only carried by a line that
+    // belongs to a sheet: the kumbukumbu_matumizi_sheeti_coherent constraint ties
+    // the two together on purpose, so a standalone note has no sheet state to keep.
+    const unusedRes = await gql(
+      `mutation{log_matumizi_kundi(input:{kumbukumbu:"${PREFIX} unusedRes",
+         vitu:[{malighafi_id:${sugar.id},hali_sheeti:haikutumika}]}){id hali kiasi}}`,
+      chef.token
+    );
+    const unusedResLine = (unusedRes?.data?.log_matumizi_kundi || [])[0];
+    check('a standalone note accepts a not-used line', Boolean(unusedResLine), msgOf(unusedRes));
+    check('a not-used line stores zero', near(unusedResLine?.kiasi, 0), `kiasi=${unusedResLine?.kiasi}`);
+
+    const mySheetsRes = await gql(`query{zingumiaji_zangu{id hali mpishi{id}}}`, chef.token);
+    check('a chef can list their own sheets', Array.isArray(mySheetsRes?.data?.zingumiaji_zangu), msgOf(mySheetsRes));
+    check(
+      'and only their own',
+      (mySheetsRes?.data?.zingumiaji_zangu || []).every((z) => String(z.mpishi && z.mpishi.id) === String(chef.id)),
+      JSON.stringify((mySheetsRes?.data?.zingumiaji_zangu || []).map((z) => z.mpishi && z.mpishi.id))
+    );
+    check(
+      'the chef sees the sheet that was replaced',
+      (mySheetsRes?.data?.zingumiaji_zangu || []).some((z) => String(z.id) === String(sheetFirstSheetId)),
+      'the superseded sheet is missing from the chef list'
+    );
+    const theirSheetsRes = await gql(`query{zingumiaji_zangu{id mpishi{id}}}`, cashier.token);
+    check(
+      "a colleague's sheets are not in the chef's list",
+      (theirSheetsRes?.data?.zingumiaji_zangu || []).length === 0,
+      JSON.stringify(theirSheetsRes?.data?.zingumiaji_zangu)
+    );
+
+    // =====================================================================
+    // Open and closed filters on the request queue
+    // =====================================================================
+    // Passing a Set straight to node-postgres serialises it as "{}", which is not
+    // a list of enum values, so this filter used to fail on the database instead
+    // of returning the queue.
+    console.log('\n  -- request filters --');
+    const openList = await gql(`query{ombi(fungua:true){id hali}}`, ownerToken);
+    check('the open request filter runs', Array.isArray(openList?.data?.ombi), msgOf(openList));
+    check(
+      'everything the open filter returns really is open',
+      (openList?.data?.ombi || []).every((o) => openListStates.has(o.hali)),
+      JSON.stringify((openList?.data?.ombi || []).map((o) => o.hali))
+    );
+    // Asserted before the states, not after. "Everything returned is open" is
+    // true of an empty list, and the empty list is exactly what the filter
+    // returns when the open states arrive at the database as "{}": no error, no
+    // rows, and a queue that looks empty because nothing was ever selected.
+    check('the open filter returns the records that are open', (openList?.data?.ombi || []).length > 0, 'open list is empty');
+
+    const closedList = await gql(`query{ombi(fungua:false){id hali}}`, ownerToken);
+    check('the closed request filter runs', Array.isArray(closedList?.data?.ombi), msgOf(closedList));
+    check(
+      'nothing the closed filter returns is still open',
+      (closedList?.data?.ombi || []).every((o) => !openListStates.has(o.hali)),
+      JSON.stringify((closedList?.data?.ombi || []).map((o) => o.hali))
+    );
 
     // =====================================================================
     // Recipes are gated by role

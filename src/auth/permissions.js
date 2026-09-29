@@ -28,12 +28,18 @@ const PERMISSIONS = {
     'stock.adjust_waste': true,
     'product.manage': true,
     'product.read': true,
-    // The inventory clerk knows real ingredient usage better than anyone, so
-    // they get recipe authoring alongside the owner.
     'recipe.manage': true,
+    // Overriding the matcher's choice of recipe. Owner only, and deliberately
+    // separate from recipe.manage: the inventory clerk can write recipes, but
+    // saying that a specific order is actually a different recipe is an owner's
+    // call about what the shop promised the customer.
+    'recipe.override': true,
     'category.manage': true,
     'ombi.tuma': true,
     'ombi.fungua': true,
+    'ombi.anzisha': true,
+    'ombi.kamilisha': true,
+    'ombi.amua': true,
     'staff.manage': true,
     'customer.manage': true,
     'report.access_dashboard': true,
@@ -53,6 +59,8 @@ const PERMISSIONS = {
     // the recipient (or the owner), so this flag is a gate, not the control.
     'ombi.tuma': true,
     'ombi.fungua': true,
+    'ombi.amua': true,
+    'ombi.kamilisha': true,
   },
   [ROLE_CHEF]: {
     'order.read_kitchen': true,
@@ -66,6 +74,15 @@ const PERMISSIONS = {
     // one who can say it's done. The resolver's recipient check does the real
     // work, so a chef still cannot close a request aimed at someone else.
     'ombi.fungua': true,
+    // A chef is routinely the person a request is addressed to, so they have to
+    // be able to pick it up, start it and call it done. None of these are the
+    // control: the state machine allows a step only from the right state, and
+    // moveOmbi still requires the caller to be the recipient or the owner. What
+    // these flags do is keep the permission layer from rejecting an action the
+    // kitchen is supposed to be allowed to take.
+    'ombi.amua': true,
+    'ombi.kamilisha': true,
+    'ombi.anzisha': true,
   },
   [ROLE_INVENTORY]: {
     'usage.read_all': true,
@@ -78,6 +95,8 @@ const PERMISSIONS = {
     'category.manage': true,
     'ombi.tuma': true,
     'ombi.fungua': true,
+    'ombi.amua': true,
+    'ombi.kamilisha': true,
   },
 };
 

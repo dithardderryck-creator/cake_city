@@ -3,8 +3,11 @@ const bcrypt = require('bcryptjs');
 const pool = require('../db/pool');
 const { signToken } = require('../auth/jwt');
 const { isLocked, recordFailure, clear } = require('../auth/loginAttempts');
-const { predictStockFor, generateUkumbusho, getPrepTime } = require('../reminders/engine');
-const { eatDateKey } = require('../lib/dates');
+   const { predictStockFor, generateUkumbusho, getPrepTime } = require('../reminders/engine');
+   const { eatDateKey } = require('../lib/dates');
+   const { matchRecipe } = require('../recipes/matcher');
+   const { buildBands } = require('../recipes/bands');
+   const { transitionAllowed, HAI: HALI_HAI } = require('../requests/stateMachine');
 const { nextTicketNumber, tikitishaAgizo } = require('../tickets/engine');
 const {
   ROLE_OWNER,
@@ -92,89 +95,279 @@ const JSONScalar = new GraphQLScalarType({
  *   2. It never moves stock. Rows land as 'inakadiriwa' and sit in the
  *      verification queue until inventory confirms the real number.
  */
-const insertUsageBatch = async (_, { agizo_id, kumbukumbu, vitu, malighafi_id, kiasi }, ctx) => {
-  const u = ctx.user;
-  requireCan(u, 'usage.create');
+const insertUsageBatch = async (
+  _,
+  { agizo_id, kumbukumbu, vitu, malighafi_id, kiasi, badilisha },
+  ctx
+) => {
+     const u = ctx.user;
+     requireCan(u, 'usage.create');
+   
+     // Work out what each line actually says before touching the database, so a
+     // bad tap is rejected with a message about the tap rather than a constraint
+     // error from halfway through the insert.
+     const raw = (vitu || [{ malighafi_id, kiasi }]).map((l) => ({
+       malighafi_id: Number(l.malighafi_id),
+       kiasi: l.kiasi === undefined || l.kiasi === null ? null : Number(l.kiasi),
+       kiasi_cha_chini:
+         l.kiasi_cha_chini === undefined || l.kiasi_cha_chini === null
+           ? null
+           : Number(l.kiasi_cha_chini),
+       kiasi_cha_juu:
+         l.kiasi_cha_juu === undefined || l.kiasi_cha_juu === null ? null : Number(l.kiasi_cha_juu),
+       hali_sheeti: l.hali_sheeti || null,
+       mapishi_kipengele_id: l.mapishi_kipengele_id ? Number(l.mapishi_kipengele_id) : null,
+       sehemu: l.sehemu || null,
+     }));
+   
+     if (!raw.length) {
+       throw new GraphQLError('Hakuna kitu chochote kilichorekodiwa.', {
+         extensions: { code: 'BAD_REQUEST' },
+       });
+     }
+   
+     const prepared = raw.map((l) => {
+       if (!Number.isInteger(l.malighafi_id) || l.malighafi_id <= 0) {
+         throw new GraphQLError('Chagua malighafi.', { extensions: { code: 'BAD_REQUEST' } });
+       }
+   
+       // "Not used" is a real answer and the only one that legitimately carries
+       // no amount. It stores 0, which the verification step confirms at 0, which
+       // moves no stock. Anything else has to say how much.
+       if (l.hali_sheeti === 'haikutumika') {
+         return { ...l, kiasi: 0, kiasi_cha_chini: null, kiasi_cha_juu: null };
+       }
+       if (l.hali_sheeti === 'nyingine' && !l.mapishi_kipengele_id && l.kiasi == null) {
+         throw new GraphQLError('Weka kiasi au chagua kipengele kimoja.', {
+           extensions: { code: 'BAD_REQUEST' },
+         });
+       }
+   
+       if (l.kiasi_cha_chini !== null && l.kiasi_cha_juu !== null) {
+         if (
+           !Number.isFinite(l.kiasi_cha_chini) ||
+           !Number.isFinite(l.kiasi_cha_juu) ||
+           l.kiasi_cha_juu < l.kiasi_cha_chini
+         ) {
+           throw new GraphQLError('Kipengele cha kiasi si sahihi.', { extensions: { code: 'BAD_REQUEST' } });
+         }
+         // The stored midpoint has to be the band the chef tapped, and the
+         // midpoint is only ever a provisional estimate. Deriving it here rather
+         // than trusting the client means the ledger cannot end up claiming a
+         // number the chef never tapped.
+         const kiasi = Math.round(((l.kiasi_cha_chini + l.kiasi_cha_juu) / 2) * 100) / 100;
+         return { ...l, kiasi, hali_sheeti: l.hali_sheeti || 'imechaguliwa' };
+       }
+   
+       if (l.kiasi == null || !Number.isFinite(l.kiasi) || l.kiasi < 0) {
+         throw new GraphQLError('Kiasi kinachotumika lazima kiwe sahihi.', {
+           extensions: { code: 'BAD_REQUEST' },
+         });
+       }
+       return { ...l, kiasi: l.kiasi, hali_sheeti: l.hali_sheeti || 'imechaguliwa' };
+     });
+   
+     // An entry with no order to explain it needs a note saying what it was
+     // for, otherwise "flour 2kg" is unattributable forever.
+     const note = kumbukumbu ? String(kumbukumbu).trim() : null;
+     if (!agizo_id && !note) {
+       throw new GraphQLError('Andika maelezo ya kile kundi (kwa mfano: "20 mandazi").', {
+         extensions: { code: 'BAD_REQUEST' },
+       });
+     }
+   
+     const client = await pool.connect();
+     try {
+       await client.query('BEGIN');
+   
+       let sheet = null;
+       if (agizo_id) {
+         const order = (await client.query('SELECT id FROM agizo_maalum WHERE id = $1', [agizo_id])).rows[0];
+         if (!order) throw new GraphQLError('Agizo halipo.', { extensions: { code: 'NOT_FOUND' } });
+   
+         // One open sheet per order. The partial unique index in migration 008 is
+         // the real guarantee; this reads it first so a double tap gets told why
+         // rather than surfacing as a raw unique violation.
+         sheet = (
+           await client.query(
+             `SELECT id FROM zingumiaji_matumizi
+               WHERE agizo_id = $1 AND hali = 'inakadiriwa' FOR UPDATE`,
+             [agizo_id]
+           )
+         ).rows[0];
+   
+         if (sheet) {
+           if (!badilisha) {
+             throw new GraphQLError('Umesharekodi matumizi ya agizo hili. Hakuna rekodi nyingine mpya.', {
+               extensions: { code: 'ALREADY_LOGGED', zingumiaji_id: sheet.id },
+             });
+           }
+            // An amend supersedes the previous sheet rather than deleting it, so
+            // the first submission stays on the record with the amounts the chef
+            // actually tapped, and the reason it was wrong is not erased by the
+            // correction. The lines are left exactly as they were and the sheet is
+            // moved out of the pending state, which is what the replacement and
+            // the verification queue key on.
+            await client.query(
+              `UPDATE zingumiaji_matumizi
+                 SET hali = 'imebadilishwa',
+                     kumbukumbu = COALESCE(NULLIF(kumbukumbu, ''),
+                       'Imebadilishwa kabla ya kuthibitishwa.')
+               WHERE id = $1`,
+              [sheet.id]
+            );
+            sheet = null;
+         }
+       }
+   
+       // Reject retired ingredients: migration 004 kept the collapsed
+       // duplicates as inactive rows, and logging against those would move
+       // stock nobody is counting.
+       const ids = prepared.map((l) => l.malighafi_id);
+       const found = (
+         await client.query('SELECT id FROM malighafi WHERE id = ANY($1::int[]) AND active', [ids])
+       ).rows.map((r) => r.id);
+       const missing = ids.filter((id) => !found.includes(id));
+       if (missing.length) {
+         throw new GraphQLError('Baadhi ya malighafi hayapatikani au yameondolewa.', {
+           extensions: { code: 'BAD_REQUEST', malighafi_ids: missing },
+         });
+       }
+   
+       // A recipe line reference has to belong to a line that really mentions
+       // this ingredient, otherwise the sheet would claim a link the recipe book
+       // contradicts. Checked here rather than trusted, because it is the chef
+       // who is filling this in.
+        const lineIds = prepared.map((l) => l.mapishi_kipengele_id).filter(Boolean);
+        let lineMap = new Map();
+        if (lineIds.length) {
+          const lines = (
+            await client.query(
+              `SELECT l.id, l.malighafi_id, l.sehemu, l.mapishi_id
+                 FROM mapishi_kipengele l
+                WHERE l.id = ANY($1::int[])`,
+              [lineIds]
+            )
+          ).rows;
+          lineMap = new Map(lines.map((l) => [l.id, l]));
+          for (const id of lineIds) {
+            if (!lineMap.has(id)) {
+              throw new GraphQLError('Kipengele cha mapishi hakipo.', { extensions: { code: 'BAD_REQUEST' } });
+            }
+          }
+          for (const l of prepared) {
+            if (l.mapishi_kipengele_id && lineMap.get(l.mapishi_kipengele_id).malighafi_id !== l.malighafi_id) {
+              throw new GraphQLError('Kipengele cha mapishi hakihusiani na malighafi uliochaguliwa.', {
+                extensions: { code: 'BAD_REQUEST' },
+              });
+            }
+          }
 
-  const lines = (vitu || [{ malighafi_id, kiasi }]).map((l) => ({
-    malighafi_id: Number(l.malighafi_id),
-    kiasi: Number(l.kiasi),
-  }));
-  if (!lines.length) {
-    throw new GraphQLError('Hakuna kitu chochote kilichorekodiwa.', {
-      extensions: { code: 'BAD_REQUEST' },
-    });
-  }
-  for (const l of lines) {
-    if (!Number.isInteger(l.malighafi_id) || l.malighafi_id <= 0) {
-      throw new GraphQLError('Chagua malighafi.', { extensions: { code: 'BAD_REQUEST' } });
-    }
-    if (!Number.isFinite(l.kiasi) || l.kiasi <= 0) {
-      throw new GraphQLError('Kiasi kinachotumika lazima kiwe zaidi ya sifuri.', {
-        extensions: { code: 'BAD_REQUEST' },
-      });
-    }
-  }
-
-  // The tap grid lets the chef hit the same ingredient more than once, so
-  // fold repeats into a single summed row instead of storing three separate
-  // "flour 1" lines for inventory to verify one at a time.
-  const folded = new Map();
-  for (const l of lines) folded.set(l.malighafi_id, (folded.get(l.malighafi_id) || 0) + l.kiasi);
-  const merged = [...folded].map(([id, amt]) => ({ malighafi_id: id, kiasi: amt }));
-
-  // An entry with no order to explain it needs a note saying what it was
-  // for, otherwise "flour 2kg" is unattributable forever.
-  const note = kumbukumbu ? String(kumbukumbu).trim() : null;
-  if (!agizo_id && !note) {
-    throw new GraphQLError('Andika maelezo ya kile kundi (kwa mfano: "20 mandazi").', {
-      extensions: { code: 'BAD_REQUEST' },
-    });
-  }
-
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-
-    if (agizo_id) {
-      const order = (await client.query('SELECT id FROM agizo_maalum WHERE id = $1', [agizo_id])).rows[0];
-      if (!order) throw new GraphQLError('Agizo halipo.', { extensions: { code: 'NOT_FOUND' } });
-    }
-
-    // Reject retired ingredients: migration 004 kept the collapsed
-    // duplicates as inactive rows, and logging against those would move
-    // stock nobody is counting.
-    const ids = merged.map((l) => l.malighafi_id);
-    const found = (
-      await client.query('SELECT id FROM malighafi WHERE id = ANY($1::int[]) AND active', [ids])
-    ).rows.map((r) => r.id);
-    const missing = ids.filter((id) => !found.includes(id));
-    if (missing.length) {
-      throw new GraphQLError('Baadhi ya malighafi hayapatikani au yameondolewa.', {
-        extensions: { code: 'BAD_REQUEST', malighafi_ids: missing },
-      });
-    }
-
-    const out = [];
-    for (const l of merged) {
-      const { rows } = await client.query(
-        `INSERT INTO kumbukumbu_matumizi
-           (agizo_id, malighafi_id, kiasi, mpishi_id, hali, kumbukumbu)
-         VALUES ($1, $2, $3, $4, 'inakadiriwa', $5)
-         RETURNING *`,
-        [agizo_id || null, l.malighafi_id, l.kiasi, u.sub, note]
-      );
-      out.push(rows[0]);
-    }
-    await client.query('COMMIT');
-    return out;
-  } catch (err) {
-    await client.query('ROLLBACK');
-    throw err;
-  } finally {
-    client.release();
-  }
-};
+          // A sheet for an order has to be built from that order's recipe. Without
+          // this, a line from any other recipe in the book passes every other
+          // check, and the order's production record ends up describing a
+          // different cake than the one being baked.
+          //
+          // An order with no recipe (an unmatched custom order) is the exception
+          // that proves the rule: there is nothing to belong to, so a reference is
+          // only allowed when the order has no recipe at all.
+          if (agizo_id) {
+            const order = (
+              await client.query('SELECT mapishi_id FROM agizo_maalum WHERE id = $1', [agizo_id])
+            ).rows[0];
+            const orderRecipe = order ? order.mapishi_id : null;
+            const stray = prepared.filter(
+              (l) => l.mapishi_kipengele_id && lineMap.get(l.mapishi_kipengele_id).mapishi_id !== orderRecipe
+            );
+            if (stray.length) {
+              throw new GraphQLError(
+                orderRecipe
+                  ? 'Baadhi ya viambato ni vya mapishi mwingine, si mapishi ya agizo hili.'
+                  : 'Agizo hili hana mapishi, kwa hivyo haiwezi kurejelea kipengele chochote cha mapishi.',
+                { extensions: { code: 'BAD_REQUEST' } }
+              );
+            }
+          }
+        }
+   
+       // The same ingredient can appear twice in a recipe (base and frosting), so
+       // folding repeats by ingredient would silently drop one of them. Fold by
+       // recipe line instead, which is what actually distinguishes the two.
+       const folded = new Map();
+       for (const l of prepared) {
+         const key = l.mapishi_kipengele_id ? `line-${l.mapishi_kipengele_id}` : `ing-${l.malighafi_id}`;
+         const prev = folded.get(key);
+         if (prev) {
+           // Two taps on the same line fold into one, keeping the band the chef
+           // widened most recently. An unused line wins outright: tapping
+           // "not used" after an amount is a correction, not an addition.
+           if (l.hali_sheeti === 'haikutumika') {
+             folded.set(key, { ...prev, hali_sheeti: 'haikutumika', kiasi: 0, kiasi_cha_chini: null, kiasi_cha_juu: null });
+           } else if (prev.hali_sheeti === 'haikutumika') {
+             // keep unused
+           } else {
+             folded.set(key, {
+               ...l,
+               kiasi: Math.round((prev.kiasi + l.kiasi) * 100) / 100,
+               kiasi_cha_chini: null,
+               kiasi_cha_juu: null,
+             });
+           }
+         } else {
+           folded.set(key, l);
+         }
+       }
+       const merged = [...folded.values()];
+   
+       if (agizo_id) {
+         const { rows: srows } = await client.query(
+           `INSERT INTO zingumiaji_matumizi (agizo_id, mpishi_id, kumbukumbu)
+            VALUES ($1, $2, $3) RETURNING *`,
+           [agizo_id, u.sub, note]
+         );
+         sheet = srows[0];
+       }
+   
+       const out = [];
+       for (const l of merged) {
+         const line = l.mapishi_kipengele_id ? lineMap.get(l.mapishi_kipengele_id) : null;
+         const { rows } = await client.query(
+           `INSERT INTO kumbukumbu_matumizi
+              (agizo_id, zingumiaji_id, hali_sheeti, malighafi_id, kiasi, kiasi_cha_chini, kiasi_cha_juu,
+               mapishi_kipengele_id, sehemu, mpishi_id, hali, kumbukumbu)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'inakadiriwa', $11)
+            RETURNING *`,
+           [
+              agizo_id || null,
+              sheet ? sheet.id : null,
+              // Only a line that belongs to a sheet carries a sheet state. The
+              // kumbukumbu_matumizi_sheeti_coherent constraint in migration 008
+              // ties these two together on purpose, because hali_sheeti answers
+              // "what did the chef say about this line" and a standalone note has
+              // no sheet to answer about. A "not used" line still stores 0, so the
+              // answer survives as the quantity.
+              sheet ? l.hali_sheeti : null,
+             l.malighafi_id,
+             l.kiasi,
+             l.kiasi_cha_chini,
+             l.kiasi_cha_juu,
+             l.mapishi_kipengele_id,
+             l.sehemu || (line ? line.sehemu : null),
+             u.sub,
+             note,
+           ]
+         );
+         out.push(rows[0]);
+       }
+       await client.query('COMMIT');
+       return out;
+     } catch (err) {
+       await client.query('ROLLBACK');
+       throw err;
+     } finally {
+       client.release();
+     }
+   };
 
 /**
  * Validate + normalise a recipe's ingredient lines. Shared by create and
@@ -286,6 +479,139 @@ const normaliseVariant = async (client, input, selfId = null) => {
 
   return { variant, mapishi_ibaba: parentId, sehemu_ya_uzito: ratio };
 };
+
+  /**
+   * The single place a request or directive changes state. Every mutation below
+   * funnels through this, so there is one permission check, one transition check
+   * and one audit trail rather than one per button.
+   */
+  const moveOmbi = async (ctx, { id, hali, jibu }) => {
+    requireAuthenticated(ctx.user);
+    const to = String(hali || '');
+    // The permission is tied to the *destination* state, not to the mutation name,
+    // so "approve" and "complete" cannot end up sharing the same gate by accident.
+    const perm = to === 'imekamilika' ? 'ombi.kamilisha' : to === 'imeanzishwa' ? 'ombi.anzisha' : 'ombi.amua';
+    requireCan(ctx.user, perm);
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      // Names the actor on the audit rows this transaction is about to write.
+      // Transaction-local, because a pooled connection must not carry one
+      // requester's id into the next one's audit trail.
+      await client.query("SELECT set_config('app.fanya_kwa', $1, true)", [String(ctx.user.sub)]);
+
+      const cur = (await client.query('SELECT * FROM ombi WHERE id = $1 FOR UPDATE', [id])).rows[0];
+      if (!cur) throw new GraphQLError('Ombi halipo.', { extensions: { code: 'NOT_FOUND' } });
+
+      const verdict = transitionAllowed(cur, to, ctx.user);
+      if (!verdict.ok) {
+        throw new GraphQLError(verdict.reason, { extensions: { code: verdict.code } });
+      }
+
+      const note = jibu ? String(jibu).trim() : null;
+      // A terminal state records who closed it and when. A finished record with
+      // nobody's name on it is a record nobody did.
+      const closing = ['imekamilika', 'imekataa', 'imeghairi'].includes(to);
+      const { rows } = await client.query(
+        `UPDATE ombi
+            SET hali = $2::hali_ombi,
+                jibu = COALESCE($3, jibu),
+                alizokamilisha_na = CASE WHEN $4 THEN $5::int ELSE alizokamilisha_na END,
+                alizokamilisha_at = CASE WHEN $4 THEN now() ELSE alizokamilisha_at END,
+                tarehe_ya_kufunguliwa = CASE WHEN $4 THEN now() ELSE tarehe_ya_kufunguliwa END
+          WHERE id = $1
+        RETURNING *`,
+        [id, to, note, closing, ctx.user.sub]
+      );
+      await client.query('COMMIT');
+      return rows[0];
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  };
+
+  /**
+   * Raise a request, or issue a directive. One mutation for both because the
+   * records are the same shape; `aina` records which way the intent points, and
+   * the state machine treats the two differently from then on.
+   *
+   * Starts at imeandikwa rather than imetumwa so a record can be corrected
+   * before anybody is told about it.
+   */
+  const raiseOmbi = async (ctx, input) => {
+    const u = ctx.user;
+    requireCan(u, 'ombi.tuma');
+    const msg = String(input.ujumbe || '').trim();
+    if (!msg) throw new GraphQLError('Andika ujumbe.', { extensions: { code: 'BAD_REQUEST' } });
+    if (String(input.kwenda_kwa) === String(u.sub)) {
+      throw new GraphQLError('Huwezi kujiombia mwenyewe.', { extensions: { code: 'BAD_REQUEST' } });
+    }
+    const to = (
+      await pool.query('SELECT id, jukumu FROM mtumiaji WHERE id = $1 AND active', [input.kwenda_kwa])
+    ).rows[0];
+    if (!to) throw new GraphQLError('Mfanyakaji hakupatikani.', { extensions: { code: 'NOT_FOUND' } });
+
+    const kiasi = input.kiasi === undefined || input.kiasi === null ? null : Number(input.kiasi);
+    // An amount with nothing to measure is a mistake, and the mistake would
+    // otherwise sit in the record until somebody tried to act on it.
+    if (kiasi !== null && (!Number.isFinite(kiasi) || kiasi <= 0)) {
+      throw new GraphQLError('Kiasi lazima kiwe zaidi ya sifuri.', { extensions: { code: 'BAD_REQUEST' } });
+    }
+    if (kiasi !== null && !input.malighafi_id) {
+      throw new GraphQLError('Chagua malighafi ili kiasi kionelewe.', { extensions: { code: 'BAD_REQUEST' } });
+    }
+    let ing = null;
+    if (input.malighafi_id) {
+      ing = (await pool.query('SELECT id FROM malighafi WHERE id = $1 AND active', [input.malighafi_id])).rows[0];
+      if (!ing) throw new GraphQLError('Malighafi hakipatikani.', { extensions: { code: 'NOT_FOUND' } });
+    }
+    if (input.agizo_id) {
+      const ord = (await pool.query('SELECT id FROM agizo_maalum WHERE id = $1', [input.agizo_id])).rows[0];
+      if (!ord) throw new GraphQLError('Agizo halipo.', { extensions: { code: 'NOT_FOUND' } });
+    }
+
+    // A one-line title so a list of twenty is readable without opening each one.
+    // Falls back to the start of the body rather than being mandatory.
+    const mada = input.mada ? String(input.mada).trim() : msg.slice(0, 60);
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query("SELECT set_config('app.fanya_kwa', $1, true)", [String(u.sub)]);
+      const { rows } = await client.query(
+        `INSERT INTO ombi
+           (kutoka_kwa, kwenda_kwa, ujumbe, mada, aina, kipendeleo, malighafi_id, kiasi,
+            agizo_id, mwisho, jukumu_anayehudumiwa, hali)
+         VALUES ($1, $2, $3, $4, $5::aina_ukumbusho_kazi, $6::kipendeleo_ukumbusho_kazi,
+                 $7, $8, $9, $10, $11, 'imeandikwa')
+         RETURNING *`,
+        [
+          u.sub,
+          input.kwenda_kwa,
+          msg,
+          mada,
+          input.aina || 'ombi',
+          input.kipendeleo || 'kawaida',
+          ing ? ing.id : null,
+          kiasi,
+          input.agizo_id || null,
+          input.mwisho || null,
+          to.jukumu,
+        ]
+      );
+      await client.query('COMMIT');
+      return rows[0];
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  };
 
 const resolvers = {
   Date: DateScalar,
@@ -406,6 +732,18 @@ const resolvers = {
       );
       return rows[0] || null;
     },
+    /**
+     * The production sheet this line belongs to, or null on a row written before
+     * sheets existed. Such a line keeps working as a plain estimate; what it
+     * cannot do is pretend to be part of a submission nobody made.
+     */
+    zingumiaji: async (log) => {
+      if (!log.zingumiaji_id) return null;
+      const { rows } = await pool.query('SELECT * FROM zingumiaji_matumizi WHERE id = $1', [
+        log.zingumiaji_id,
+      ]);
+      return rows[0] || null;
+    },
   },
 
   Bidhaa: {
@@ -480,8 +818,18 @@ const resolvers = {
     // Stored lines are the recipe's own; a null id already signals "derived",
     // but this makes the distinction explicit for the UI instead of requiring
     // it to infer intent from a null.
-    inayotokwa: (line) => line.inayotokwa === true || line.id == null,
-  },
+       inayotokwa: (line) => line.inayotokwa === true || line.id == null,
+       // The tappable amounts, derived on read from the range already stored.
+       // Deriving them rather than storing them means a recipe edit changes what
+       // the chef is offered with no second write, and there is no way for the
+       // buttons and the recipe to disagree.
+       vipendeleo: async (line) => {
+         const { rows } = await pool.query('SELECT unit FROM malighafi WHERE id = $1', [
+           line.malighafi_id,
+         ]);
+         return buildBands(line.kiasi_cha_chini, line.kiasi_cha_juu, rows[0]?.unit);
+       },
+     },
 
   Ombi: {
     kutoka_kwa: async (o) => {
@@ -496,6 +844,112 @@ const resolvers = {
         'SELECT id, jina, jukumu FROM mtumiaji WHERE id = $1',
         [o.kwenda_kwa]
       );
+      return rows[0] || null;
+    },
+    malighafi: async (o) => {
+      if (!o.malighafi_id) return null;
+      const { rows } = await pool.query('SELECT * FROM malighafi WHERE id = $1', [o.malighafi_id]);
+      return rows[0] || null;
+    },
+    agizo: async (o) => {
+      if (!o.agizo_id) return null;
+      const { rows } = await pool.query('SELECT * FROM agizo_maalum WHERE id = $1', [o.agizo_id]);
+      return rows[0] || null;
+    },
+    alizokamilisha_na: async (o) => {
+      if (!o.alizokamilisha_na) return null;
+      const { rows } = await pool.query(
+        'SELECT id, jina, jukumu FROM mtumiaji WHERE id = $1',
+        [o.alizokamilisha_na]
+      );
+      return rows[0] || null;
+    },
+
+    // Whether anybody still owes an answer. Computed rather than stored so a
+    // record cannot be left sitting in a closed state while the list that drives
+    // the owner's morning still calls it open.
+    hai: (o) => HALI_HAI.has(o.hali),
+
+    // Overdue means past its own deadline and still open. A directive with no
+    // deadline is never overdue, which is why mwisho being null is not enough to
+    // say yes here.
+    // Compared as local calendar days, not timestamps. A deadline of today is not
+    // an overdue deadline until tomorrow, and letting the clock decide that would
+    // make a record overdue at 00:01 for a whole day the owner never intended.
+    imeishia_muda: (o) =>
+      !!o.mwisho && HALI_HAI.has(o.hali) && eatDateKey(o.mwisho) < eatDateKey(),
+
+    /**
+     * The record's own history, read back out of the audit log rather than kept
+     * in a second table. A parallel timeline is a timeline that can disagree with
+     * what happened, and the whole point of asking "who approved this and when"
+     * is that the answer cannot be edited independently of the decision.
+     */
+    historia: async (o) => {
+      const { rows } = await pool.query(
+        `SELECT data_ya_baada->>'hali' AS hali,
+                COALESCE(data_ya_baada->>'jibu', data_ya_kabla->>'jibu') AS ujumbe,
+                fanya_kwa, tarehe
+           FROM kumbukumbu_kitendo
+          WHERE meza = 'ombi' AND node_id = $1
+          ORDER BY id ASC`,
+        [o.id]
+      );
+      return rows
+        .filter((r) => r.hali)
+        .map((r) => ({
+          hali: r.hali,
+          ujumbe: r.ujumbe,
+          tarehe: r.tarehe,
+          aliyefanya: r.fanya_kwa,
+        }));
+    },
+  },
+
+  IsharaOmbi: {
+    aliyefanya: async (i) => {
+      if (!i.aliyefanya) return null;
+      const { rows } = await pool.query(
+        'SELECT id, jina, jukumu FROM mtumiaji WHERE id = $1',
+        [i.aliyefanya]
+      );
+      return rows[0] || null;
+    },
+  },
+
+  /**
+   * A sheet, with its lines attached. Resolving them here rather than in the
+   * insert means a sheet read after a correction shows the correction, and there
+   * is no stored copy to forget to update.
+   */
+  ZingumiajiMatumizi: {
+    mistari: async (s) => {
+      const { rows } = await pool.query(
+        `SELECT * FROM kumbukumbu_matumizi
+          WHERE zingumiaji_id = $1
+          ORDER BY (hali_sheeti = 'haikutumika'), malighafi_id, id`,
+        [s.id]
+      );
+      return rows;
+    },
+    mpishi: async (s) => {
+      if (!s.mpishi_id) return null;
+      const { rows } = await pool.query(
+        'SELECT id, jina, jukumu FROM mtumiaji WHERE id = $1',
+        [s.mpishi_id]
+      );
+      return rows[0] || null;
+    },
+    imethibitishwa_na: async (s) => {
+      if (!s.imethibitishwa_na) return null;
+      const { rows } = await pool.query(
+        'SELECT id, jina, jukumu FROM mtumiaji WHERE id = $1',
+        [s.imethibitishwa_na]
+      );
+      return rows[0] || null;
+    },
+    agizo: async (s) => {
+      const { rows } = await pool.query('SELECT * FROM agizo_maalum WHERE id = $1', [s.agizo_id]);
       return rows[0] || null;
     },
   },
@@ -858,8 +1312,30 @@ const resolvers = {
              FROM kumbukumbu_matumizi k
              LEFT JOIN agizo_maalum a ON a.id = k.agizo_id
              LEFT JOIN mapishi m       ON m.id = a.mapishi_id
+             LEFT JOIN zingumiaji_matumizi z ON z.id = k.zingumiaji_id
             WHERE k.hali = 'inakadiriwa'
+              AND (k.zingumiaji_id IS NULL OR z.hali = 'inakadiriwa')
             ORDER BY k.tarehe DESC`
+        );
+        return rows;
+      },
+
+      /**
+       * The chef's own sheets.
+       *
+       * Scoped to the sheets this person submitted, and it includes superseded
+       * ones. A chef who has to correct a submission still needs to see that the
+       * first one is there, and hiding it would be the same hole the amend path
+       * used to have: the correction would be visible and the thing it corrected
+       * would not be.
+       */
+      zingumiaji_zangu: async (_, __, ctx) => {
+        requireAuthenticated(ctx.user);
+        const { rows } = await pool.query(
+          `SELECT * FROM zingumiaji_matumizi
+            WHERE mpishi_id = $1
+            ORDER BY tarehe DESC, id DESC`,
+          [ctx.user.sub]
         );
         return rows;
       },
@@ -871,20 +1347,43 @@ const resolvers = {
         return rows;
       },
 
-      ombi: async (_, { fungua }, ctx) => {
+      /**
+       * What you can see. Staff see what they sent and what was sent to them;
+       * the owner sees everything. A general staff member has no way to read
+       * someone else's request, which is the behaviour a shop actually wants.
+       */
+      ombi: async (_, { fungua, aina }, ctx) => {
         requireAuthenticated(ctx.user);
+        const u = ctx.user;
         const params = [];
-        let sql = 'SELECT * FROM ombi';
-        if (fungua !== undefined && fungua !== null) {
-          // Map the boolean to the enum label rather than casting: passing the
-          // GraphQL boolean straight through arrives as the string "true",
-          // which is not a valid hali_ombi value.
-          params.push(fungua ? 'fungua' : 'imefanyika');
-          sql += ` WHERE hali = $${params.length}::hali_ombi`;
+        const where = [];
+        const add = (v) => {
+          params.push(v);
+          return `$${params.length}`;
+        };
+
+        if (u.jukumu !== ROLE_OWNER) {
+          where.push(`(kutoka_kwa = ${add(u.sub)} OR kwenda_kwa = ${add(u.sub)})`);
         }
-        // Both directions are visible to everyone, so you can see what you
-        // asked for as well as what was asked of you. Open first.
-        sql += ` ORDER BY (hali = 'fungua') DESC, created_at DESC`;
+        // Spread the Set into an array. node-postgres does not understand a Set;
+        // it JSON-encodes one as "{}", and "{}" is not a list of enum values, so
+        // the filter would fail on the database rather than return the wrong rows.
+        if (fungua === true) {
+          // "Open" is any state still waiting on somebody. Listing by the old
+          // two-state pair would hide a directive the recipient has accepted but
+          // not finished, which is exactly the thing an owner needs to see.
+          where.push(`hali = ANY(${add([...HALI_HAI])}::hali_ombi[])`);
+        } else if (fungua === false) {
+          where.push(`hali <> ALL(${add([...HALI_HAI])}::hali_ombi[])`);
+        }
+        if (aina) {
+          where.push(`aina = ${add(aina)}::aina_ukumbusho_kazi`);
+        }
+
+        const sql =
+          'SELECT * FROM ombi' +
+          (where.length ? ` WHERE ${where.join(' AND ')}` : '') +
+          ` ORDER BY created_at DESC`;
         const { rows } = await pool.query(sql, params);
         return rows;
       },
@@ -1303,38 +1802,74 @@ const resolvers = {
           ).rows[0];
           mtejaJina = m?.jina;
         }
-        // Link the order to a recipe from the book. This is what makes the
-        // chef's tap sheet prefill instead of starting blank, so it is set
-        // here rather than inferred later. Validated against an ACTIVE recipe:
-        // a retired recipe should not silently prefill a new order.
-        let mapishiId = null;
-        if (input.mapishi_id) {
-          const rec = (
-            await client.query('SELECT id FROM mapishi WHERE id = $1 AND active', [input.mapishi_id])
-          ).rows[0];
-          if (!rec) {
-            throw new GraphQLError('Mapishi hakupatikani.', { extensions: { code: 'NOT_FOUND' } });
-          }
-          mapishiId = rec.id;
-        }
-          const { rows } = await client.query(
-            `INSERT INTO agizo_maalum
-             (mteja_id, ladha, design, ukubwa, tarehe_ya_kuchukua, bei_jumla, malipo_ya_awali, hali, created_by, mapishi_id, umbo, maelekezo_maalum)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, 'ordered', $8, $9, $10, $11) RETURNING *`,
-            [
-              mtejaId,
-              input.ladha,
-              input.design || null,
-              input.ukubwa || null,
-              input.tarehe_ya_kuchukua,
-              input.bei_jumla,
-              malipo_ya_awali,
-              u.sub,
-              mapishiId,
-              (input.umbo || '').trim() || null,
-              (input.maelekezo_maalum || '').trim() || null,
-            ]
-          );
+           // Which recipe this order is made from is decided here, not at the
+           // counter. The cashier described a cake; the kitchen's recipe book is
+           // an internal document and the person least able to choose correctly
+           // from it was the one being asked to.
+           //
+           // A client may still send mapishi_id, and only the owner may: that is
+           // the deliberate override for an order the matcher reads wrong. It is
+           // recorded as 'fuati' so an overridden match is never later mistaken
+           // for one the system worked out on its own.
+           let mapishiId = null;
+           let mapishiMethod = null;
+           let mapishiScore = null;
+           let mapishiReason = null;
+
+           if (input.mapishi_id) {
+             requireCan(u, 'recipe.override', 'Unaweza kubadilisha mapishi kwa agizo tu kama mmiliki.');
+             const rec = (
+               await client.query('SELECT id FROM mapishi WHERE id = $1 AND active', [input.mapishi_id])
+             ).rows[0];
+             if (!rec) {
+               throw new GraphQLError('Mapishi hakupatikani.', { extensions: { code: 'NOT_FOUND' } });
+             }
+             mapishiId = rec.id;
+             mapishiMethod = 'fuati';
+             mapishiReason = {
+               ulio: 'fuati',
+               maelezo: 'Mmiliki alichagua mapishi mwenyewe badala ya kile kilichopatikana kwa njia ya kawaida.',
+               maombi: { ladha: input.ladha, ukubwa: input.ukubwa, umbo: input.umbo },
+             };
+           } else {
+             // The matcher is handed the whole active book and returns one
+             // recipe. It never returns a list: a shortlist rendered anywhere in
+             // the UI is a recipe picker again, and the decision goes back to the
+             // cashier.
+             const kitabu = (
+               await client.query('SELECT id, ladha, ukubwa, active FROM mapishi WHERE active ORDER BY id')
+             ).rows;
+             const ulio = matchRecipe(
+               { ladha: input.ladha, ukubwa: input.ukubwa, umbo: input.umbo },
+               kitabu
+             );
+             mapishiId = ulio.mapishi_id;
+             mapishiMethod = ulio.method;
+             mapishiScore = ulio.score;
+             mapishiReason = ulio.reason;
+           }
+             const { rows } = await client.query(
+               `INSERT INTO agizo_maalum
+                (mteja_id, ladha, design, ukubwa, tarehe_ya_kuchukua, bei_jumla, malipo_ya_awali, hali, created_by, mapishi_id, umbo, maelekezo_maalum,
+                 mapishi_match_method, mapishi_match_score, mapishi_match)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, 'ordered', $8, $9, $10, $11, $12, $13, $14) RETURNING *`,
+               [
+                 mtejaId,
+                 input.ladha,
+                 input.design || null,
+                 input.ukubwa || null,
+                 input.tarehe_ya_kuchukua,
+                 input.bei_jumla,
+                 malipo_ya_awali,
+                 u.sub,
+                 mapishiId,
+                 (input.umbo || '').trim() || null,
+                 (input.maelekezo_maalum || '').trim() || null,
+                 mapishiMethod,
+                 mapishiScore,
+                 mapishiReason ? JSON.stringify(mapishiReason) : null,
+               ]
+             );
            const agizo = rows[0];
            const maelezo = `${agizo.ladha}${agizo.ukubwa ? ` — ${agizo.ukubwa}` : ''}`;
            const tikiti = await tikitishaAgizo(client, {
@@ -1765,47 +2300,27 @@ const resolvers = {
       return rowCount;
     },
 
-    tumia_ombi: async (_, { kwenda_kwa, ujumbe }, ctx) => {
-      requireCan(ctx.user, 'ombi.tuma');
-      const msg = String(ujumbe || '').trim();
-      if (!msg) throw new GraphQLError('Andika ujumbe.', { extensions: { code: 'BAD_REQUEST' } });
-      if (String(kwenda_kwa) === String(ctx.user.sub)) {
-        throw new GraphQLError('Huwezi kujiombia mwenyewe.', { extensions: { code: 'BAD_REQUEST' } });
-      }
-      const to = (
-        await pool.query('SELECT id FROM mtumiaji WHERE id = $1 AND active', [kwenda_kwa])
-      ).rows[0];
-      if (!to) throw new GraphQLError('Mfanyakaji hakupatikani.', { extensions: { code: 'NOT_FOUND' } });
-      const { rows } = await pool.query(
-        'INSERT INTO ombi (kutoka_kwa, kwenda_kwa, ujumbe) VALUES ($1, $2, $3) RETURNING *',
-        [ctx.user.sub, kwenda_kwa, msg]
-      );
-      return rows[0];
-    },
 
     /**
-     * Only the person the request was addressed to may close it. The owner is
-     * allowed too, otherwise a request sent to a staff member who then left
-     * would sit open forever with nobody able to clear it.
+     * Raise a request, or issue a directive. The schema exposes this as one
+     * mutation; `input.aina` says which way the intent points.
      */
-    fungua_ombi: async (_, { id, jibu }, ctx) => {
-      requireCan(ctx.user, 'ombi.fungua');
-      const cur = (await pool.query('SELECT * FROM ombi WHERE id = $1', [id])).rows[0];
-      if (!cur) throw new GraphQLError('Ombi halipo.', { extensions: { code: 'NOT_FOUND' } });
-      const isRecipient = String(cur.kwenda_kwa) === String(ctx.user.sub);
-      if (!isRecipient && ctx.user.jukumu !== ROLE_OWNER) {
-        throw new GraphQLError('Ombi huu ni wa mtu mwingine.', { extensions: { code: 'FORBIDDEN' } });
-      }
-      if (cur.hali === 'imefanyika') {
-        throw new GraphQLError('Ombi tayari umefunguliwa.', { extensions: { code: 'ALREADY_CLOSED' } });
-      }
-      const { rows } = await pool.query(
-        `UPDATE ombi SET hali = 'imefanyika', jibu = $2, tarehe_ya_kufunguliwa = now()
-          WHERE id = $1 RETURNING *`,
-        [id, jibu ? String(jibu).trim() : null]
-      );
-      return rows[0];
-    },
+    tuma_ombi: async (_, { input }, ctx) => raiseOmbi(ctx, input),
+
+    /**
+     * Move a record to a new state. The reachable set, the role allowed to do
+     * it, and the refusal of self-approval all come from the state machine, so
+     * adding a button in the UI cannot grant a power the backend does not have.
+     */
+    sasisha_ombi: async (_, args, ctx) => moveOmbi(ctx, args),
+
+    /** Shorthand for "done", the one closing state people actually reach for. */
+    kamilisha_ombi: async (_, { id, jibu }, ctx) =>
+      moveOmbi(ctx, { id, hali: 'imekamilika', jibu }),
+
+    /** Withdraw something that has not been finished. */
+    ghairi_ombi: async (_, { id, sababu }, ctx) =>
+      moveOmbi(ctx, { id, hali: 'imeghairi', jibu: sababu }),
 
 
     marekebisho_hisa: async (_, { input }, ctx) => {

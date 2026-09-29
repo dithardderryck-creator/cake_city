@@ -614,6 +614,20 @@ const normaliseVariant = async (client, input, selfId = null) => {
       const cur = (await client.query('SELECT * FROM ombi WHERE id = $1 FOR UPDATE', [id])).rows[0];
       if (!cur) throw new GraphQLError('Ombi halipo.', { extensions: { code: 'NOT_FOUND' } });
 
+      // A usage-sheet request (BR-13) does not merely get answered, it *is* the
+      // confirmation: its request is the only thing standing between a
+      // reported usage and stock that has actually moved. Letting the generic
+      // close it would mark the report handled while the numbers on the shelf
+      // stayed the ones somebody guessed. So the one mutation that can move the
+      // stock is the only one that can close this request.
+      if (cur.zingumiaji_id && to !== 'imeghairi') {
+        throw new GraphQLError(
+          'Ombi hili la matumizi hukamilishwa kwa kuthibitisha ripoti yenyewe. ' +
+            'Hisa hazibadilishwi hadi ipo.',
+          { extensions: { code: 'FORBIDDEN' } }
+        );
+      }
+
       const verdict = transitionAllowed(cur, to, ctx.user);
       if (!verdict.ok) {
         throw new GraphQLError(verdict.reason, { extensions: { code: verdict.code } });
@@ -1056,6 +1070,11 @@ const resolvers = {
    * is no stored copy to forget to update.
    */
   ZingumiajiMatumizi: {
+    // The table calls it tarehe; the schema has always promised created_at,
+    // because that is what every other type in the schema calls the same
+    // column. Resolved rather than renamed so no query ever reads null for a
+    // field it is entitled to, and no migration touches real data.
+    created_at: (s) => s.tarehe,
     mistari: async (s) => {
       const { rows } = await pool.query(
         `SELECT * FROM kumbukumbu_matumizi

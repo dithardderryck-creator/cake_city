@@ -1768,8 +1768,12 @@ export default function Inventory() {
   const queue = queueData?.kumbukumbu_matumizi_kusubiri || []
   const pending = queue.length
   const low = items.filter(needsOrdering).length
+  // Counted by hai, not by a literal state. `hai` is the field that means "still
+  // waiting on somebody", so it stays right as states are added; matching a
+  // single enum value silently counted zero for every request, because the
+  // state that request is actually raised in is inasubiri.
   const myOpenRequests = (ombiData?.ombi || []).filter(
-    (o) => o.hali === 'fungua' && String(o.kwenda_kwa?.id) === String(user?.id)
+    (o) => o.hai && String(o.kwenda_kwa?.id) === String(user?.id)
   ).length
 
   // The verification queue is this role's main daily task, so its count leads the

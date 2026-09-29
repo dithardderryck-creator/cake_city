@@ -290,6 +290,25 @@ async function main() {
     recipientToken
   );
   check('the request is visible to the inventory member', !errOf(inbox), msgOf(inbox));
+
+  // The schema promises created_at on a usage sheet, but the table column is
+  // tarehe. A field resolver bridges the two, and this pins it: without it any
+  // client sorting a queue by when the sheet was raised sorts by null.
+  const sheetRow = await sql('SELECT tarehe FROM zingumiaji_matumizi WHERE id = $1', [sheetId]);
+  const viaGraphQL = await gql(
+    `query { ombi(fungua: true) { zingumiaji { id created_at } } }`,
+    recipientToken
+  );
+  const sheetViaGraphQL = (viaGraphQL.data?.ombi || [])
+    .map((r) => r.zingumiaji)
+    .find((s) => s && String(s.id) === String(sheetId));
+  check(
+    'the sheet reports created_at, matching the tarehe the table stores',
+    !!sheetViaGraphQL?.created_at &&
+      new Date(sheetViaGraphQL.created_at).toISOString() ===
+        new Date(sheetRow[0]?.tarehe).toISOString(),
+    `gql=${sheetViaGraphQL?.created_at} db=${sheetRow[0]?.tarehe}`
+  );
   const inInbox = (inbox.data?.ombi || []).some(
     (r) => r.zingumiaji && Number(r.zingumiaji.id) === Number(sheetId)
   );
@@ -366,6 +385,72 @@ async function main() {
     { id: sheetId }
   );
   check('a line from another sheet is rejected', !!errOf(stray), 'no error raised');
+
+  // ---- BR-13: the request cannot be closed without moving the stock -------
+  // A second sheet, left open on purpose, so the guard can be tried against a
+  // request that is still genuinely waiting. Closing this one with the generic
+  // mutation would be the incoherence BR-13 exists to remove: the request says
+  // the usage is handled, the sheet is still unconfirmed, and the stock on the
+  // shelf is still whatever the chef guessed.
+  const order2 = (
+    await sql(
+      `INSERT INTO agizo_maalum (ladha, mapishi_id, bei_jumla, hali, tarehe_ya_kuchukua, created_by)
+       VALUES ($1, (SELECT id FROM mapishi ORDER BY id LIMIT 1), 50000, 'ordered', CURRENT_DATE, $2) RETURNING id`,
+      [`${PREFIX} Order2`, staff.chef]
+    )
+  )[0];
+  created.agizo.push(order2.id);
+
+  const report2 = await gql(
+    `mutation ($input: MatumiziKundiInput!) {
+       log_matumizi_kundi(input: $input) { id zingumiaji { id } }
+     }`,
+    chef,
+    {
+      input: {
+        agizo_id: order2.id,
+        vitu: [{ malighafi_id: ing.id, kiasi_cha_chini: 1, kiasi_cha_juu: 1, hali_sheeti: 'imechaguliwa' }],
+      },
+    }
+  );
+  const sheet2 = report2.data?.log_matumizi_kundi?.[0]?.zingumiaji?.id;
+  check('a second open sheet was raised for the guard check', !!sheet2, `sheet=${sheet2}`);
+
+  const stockBeforeGuard = await onHand(ing.id);
+  const shortcut = await gql(
+    `mutation ($id: ID!) { kamilisha_ombi(id: $id, jibu: "nimemaliza") { id hali } }`,
+    recipientToken,
+    { id: (await sql(`SELECT id FROM ombi WHERE zingumiaji_id = $1`, [sheet2]))[0]?.id }
+  );
+  check(
+    'BR-13: a usage request cannot be closed with the generic mutation',
+    codeOf(shortcut) === 'FORBIDDEN',
+    `code=${codeOf(shortcut)} msg=${msgOf(shortcut)}`
+  );
+  const sheet2State = await sql('SELECT hali FROM zingumiaji_matumizi WHERE id = $1', [sheet2]);
+  check(
+    'the sheet is still unconfirmed after the shortcut attempt',
+    sheet2State[0]?.hali === 'inakadiriwa',
+    `hali=${sheet2State[0]?.hali}`
+  );
+  check(
+    'and no stock moved',
+    (await onHand(ing.id)) === stockBeforeGuard,
+    `on_hand=${stockBeforeGuard} -> ${await onHand(ing.id)}`
+  );
+
+  // Clearing it the sanctioned way proves the sheet was still answerable, so
+  // the guard above blocked the shortcut rather than having broken the flow.
+  const viaConfirm = await gql(
+    `mutation ($id: ID!) { thibitisha_matumizi_kundi(zingumiaji_id: $id) { id hali } }`,
+    recipientToken,
+    { id: sheet2 }
+  );
+  check(
+    'the sheet can still be confirmed the proper way',
+    viaConfirm.data?.thibitisha_matumizi_kundi?.hali === 'imethibitishwa',
+    `hali=${viaConfirm.data?.thibitisha_matumizi_kundi?.hali}`
+  );
 }
 
 async function run() {

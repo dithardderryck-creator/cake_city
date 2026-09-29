@@ -11,6 +11,7 @@ import { FieldSquare } from '../ui/Field'
 import { Select } from '../ui/Select'
 import { Sparkline, TrendChart, StatusPill } from '../ui/charts'
 import CollectBalanceModal from '../ui/CollectBalanceModal'
+import RequestInbox from '../ui/RequestInbox'
 import { ChartLineUp, Wallet, Package, ChefHat, UserPlus, Plus, XCircle, Bell, Hourglass, Pencil, Trash, Scroll } from '@phosphor-icons/react'
 
 const PAYMENT_LABELS = { cash: 'Taslimu', mpesa: 'M-Pesa', tigopesa: 'Tigo Pesa', airtel_money: 'Airtel Money' }
@@ -518,6 +519,7 @@ export default function Owner() {
   const [tab, setTab] = useState('overview')
   const tabs = [
     { key: 'overview', label: 'Muhtasari', icon: ChartLineUp },
+    { key: 'requests', label: 'Maombi', icon: Bell },
     { key: 'products', label: 'Bidhaa', icon: Package },
     { key: 'staff', label: 'Wafanyakazi', icon: UserPlus },
     { key: 'audit', label: 'Ukaguzi', icon: Scroll },
@@ -549,6 +551,7 @@ export default function Owner() {
         ))}
       </div>
       {tab === 'overview' && <OverviewTab />}
+      {tab === 'requests' && <RequestInbox />}
       {tab === 'products' && <ProductsTab />}
       {tab === 'staff' && <StaffTab />}
       {tab === 'audit' && <AuditTab />}

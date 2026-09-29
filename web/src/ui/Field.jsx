@@ -20,7 +20,7 @@ export const Field = forwardRef(function Field({ label, error, className = '', .
   )
 })
 
-export const FieldSquare = forwardRef(function FieldSquare({ label, error, className = '', ...props }, ref) {
+export const FieldSquare = forwardRef(function FieldSquare({ label, error, hint, className = '', ...props }, ref) {
   return (
     <div className={`flex flex-col gap-1.5 ${className}`}>
       {label && (
@@ -35,6 +35,9 @@ export const FieldSquare = forwardRef(function FieldSquare({ label, error, class
           {...props}
         />
       </div>
+      {/* hint is pulled out of props above so it does not land on the DOM input
+          as an unknown attribute, and does not get mistaken for a value. */}
+      {hint && !error && <span className="text-[11px] text-espresso-muted/80">{hint}</span>}
       {error && <span className="text-[11px] text-red-500 font-medium">{error}</span>}
     </div>
   )

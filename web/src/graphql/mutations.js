@@ -245,3 +245,18 @@ export const GHAIRI_OMBI = gql`
     ghairi_ombi(id: $id, sababu: $sababu) { id hali jibu }
   }
 `
+
+/**
+ * BR-05/D-28: the owner's answer to a quote request. The only way an
+ * awaiting_quote order becomes ordered, and the only way the cashier's
+ * described cake gets a price. The response carries the kitchen ticket, so
+ * the owner can see the job actually reached production.
+ */
+export const TOA_BEI = gql`
+  mutation ToaBei($id: ID!, $bei: Float!, $malipo_ya_awali: Float, $njia_ya_malipo: NjiaMalipo) {
+    toa_bei(id: $id, bei: $bei, malipo_ya_awali: $malipo_ya_awali, njia_ya_malipo: $njia_ya_malipo) {
+      id ladha hali bei_jumla malipo_ya_awali salio
+      tikiti { id namba }
+    }
+  }
+`

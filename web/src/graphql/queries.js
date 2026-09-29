@@ -239,7 +239,8 @@ export const OMBI = gql`
       kwenda_kwa { id jina jukumu }
       alizokamilisha_na { id jina jukumu }
       malighafi { id jina }
-      agizo { id ladha umbo }
+      agizo { id ladha umbo hali bei_jumla salio mteja { id jina simu } maelekezo_maalum ukubwa }
+      zingumiaji { id kumbukumbu hali }
       historia { hali ujumbe tarehe aliyefanya { id jina } }
     }
   }

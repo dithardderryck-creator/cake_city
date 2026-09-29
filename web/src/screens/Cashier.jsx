@@ -260,9 +260,17 @@ function OrderTab() {
     else if (mode === 'nusuri') update('amali', '')
   }
 
+  // Defined before submit uses them. Both are 0 when the field is blank, which
+  // is the "no price yet, ask the owner" case rather than a price of zero.
+  const beiNum = Number(form.bei) || 0
+  const amaliNum = Number(form.amali) || 0
+
   const submit = async (e) => {
     e.preventDefault()
-    if (!form.ladha || !form.tarehe || !form.bei) return
+    // BR-05/D-28: the price is the owner's to set, not the till's. Leaving the
+    // price blank describes the cake and asks the owner to quote it, instead of
+    // forcing a number the cashier was never meant to decide.
+    if (!form.ladha || !form.tarehe) return
     setBusy(true)
     setOrderErr(null)
     try {
@@ -278,8 +286,13 @@ function OrderTab() {
             umbo: form.umbo || undefined,
             maelekezo_maalum: form.maelekezo || undefined,
             tarehe_ya_kuchukua: form.tarehe,
-            bei_jumla: Number(form.bei),
-            malipo_ya_awali: Number(form.amali) || 0,
+            // Omitted entirely when blank, which is what puts the order into
+            // awaiting_quote and raises the quote request. A price typed here is
+            // still accepted, for the cases where the owner has already said.
+            ...(beiNum > 0 ? { bei_jumla: beiNum } : {}),
+            // A deposit is only meaningful against a price, so it rides along
+            // with one rather than being sent on its own.
+            malipo_ya_awali: beiNum > 0 ? amaliNum : 0,
             njia_ya_malipo: orderPayment,
           },
         },
@@ -296,8 +309,6 @@ function OrderTab() {
     finally { setBusy(false) }
   }
 
-  const beiNum = Number(form.bei) || 0
-  const amaliNum = Number(form.amali) || 0
   const salio = beiNum - amaliNum
 
   const printOrder = () => window.print()
@@ -339,8 +350,16 @@ function OrderTab() {
              <FieldSquare label="Muundo (Design)" value={form.design} onChange={(e) => update('design', e.target.value)} placeholder="Maelezo ya muundo..." />
             <div className="grid grid-cols-2 gap-3">
               <FieldSquare label="Tarehe ya kuchukua" type="date" required value={form.tarehe} onChange={(e) => update('tarehe', e.target.value)} />
-              <FieldSquare label="Bei (TSh)" type="number" min="0" required value={form.bei} onChange={(e) => { update('bei', e.target.value); if (payMode === 'kamili') update('amali', e.target.value) }} placeholder="80000" />
+              <FieldSquare label="Bei (TSh)" type="number" min="0" hint="Acha tupi ili mmiliki abe bei" value={form.bei} onChange={(e) => { update('bei', e.target.value); if (payMode === 'kamili') update('amali', e.target.value) }} placeholder="80000" />
             </div>
+
+            {/* BR-05: with no price there is nothing to take a deposit against,
+                so the payment choices are out of reach until the owner quotes. */}
+            {beiNum <= 0 && (
+              <p className="text-xs text-copper bg-copper/5 rounded-lg px-3 py-2 ring-1 ring-copper/20">
+                Bila bei, agizo litaomba bei kwa mmiliki kabla ya kuanza. Hakuna malipo ya awali.
+              </p>
+            )}
 
             <p className="cc-eyebrow mt-2 mb-1">Malipo</p>
             <div className="grid grid-cols-3 gap-2">
@@ -353,7 +372,7 @@ function OrderTab() {
                   key={o.key}
                   type="button"
                   onClick={() => applyPayMode(o.key)}
-                  disabled={!form.bei && o.key === 'kamili'}
+                  disabled={!beiNum && o.key !== 'bila'}
                   className={`flex flex-col items-center gap-0.5 px-2 py-2.5 rounded-xl text-center transition-all duration-300 ease-[cubic-bezier(0.32,0.72,0,1)] active:scale-[0.97] disabled:opacity-40 disabled:cursor-not-allowed ${
                     payMode === o.key
                       ? 'bg-copper text-white ring-1 ring-copper'
@@ -407,15 +426,15 @@ function OrderTab() {
               <p className="text-xs text-red-600 bg-red-50 rounded-lg px-3 py-2 ring-1 ring-red-200">{orderErr}</p>
             )}
 
-            <Btn type="submit" variant="primary" size="lg" iconRight={ArrowRight} disabled={busy || !form.bei || amaliNum > beiNum || (payMode === 'nusuri' && !amaliNum)} className="w-full">
-              {busy ? 'Inaundwa...' : 'Unda Agizo'}
+            <Btn type="submit" variant="primary" size="lg" iconRight={ArrowRight} disabled={busy || !form.ladha || !form.tarehe || (beiNum > 0 && (amaliNum > beiNum || (payMode === 'nusuri' && !amaliNum)))} className="w-full">
+              {busy ? 'Inaundwa...' : beiNum > 0 ? 'Unda Agizo' : 'Omba Bei'}
             </Btn>
 
         </form>
       </CardFull>
 
       {/* Order ticket modal */}
-      <Modal open={!!orderResult} onClose={() => setOrderResult(null)} title="Agizo Limetengenezwa" className="max-w-xl">
+      <Modal open={!!orderResult} onClose={() => setOrderResult(null)} title={orderResult?.hali === 'awaiting_quote' ? 'Agizo Limeombwa Bei' : 'Agizo Limetengenezwa'} className="max-w-xl">
         {orderResult && (
           <div className="flex flex-col items-center gap-4 text-center">
             <div className="w-12 h-12 rounded-full bg-copper/[0.1] flex items-center justify-center">
@@ -423,8 +442,24 @@ function OrderTab() {
             </div>
             <p className="text-sm text-espresso-muted">Agizo namba</p>
             <p className="font-serif text-lg font-semibold">{orderResult.ladha} — {orderResult.ukubwa || '—'}</p>
-            <p className="cc-num text-2xl font-semibold">{fmtTSh(orderResult.bei_jumla)}</p>
-            <StatusPill tone="neutral">Imeagizwa</StatusPill>
+            {/* BR-05: an unquoted order has no price yet. Showing TSh 0 would
+                read as free, so say what is actually true: the owner owes a
+                number, and nobody can take payment until it lands. */}
+            {orderResult.hali === 'awaiting_quote' ? (
+              <>
+                <p className="text-sm font-semibold text-copper">Bei inaombwa kwa mmiliki</p>
+                <StatusPill tone="neutral">Inasubiri bei</StatusPill>
+                <p className="text-xs text-espresso-muted max-w-xs">
+                  Agizo limewekwa kwenye orodha ya mmiliki. Atakapoweka bei, itaenda
+                  moja kwa moja na tikiti itatuma kwenye rafiki.
+                </p>
+              </>
+            ) : (
+              <>
+                <p className="cc-num text-2xl font-semibold">{fmtTSh(orderResult.bei_jumla)}</p>
+                <StatusPill tone="neutral">Imeagizwa</StatusPill>
+              </>
+            )}
 
             {orderResult.tikiti && (
               <div className="w-full flex flex-col items-center my-2 border-t border-hairline pt-5">

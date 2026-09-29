@@ -16,8 +16,8 @@ import {
   ONGEZA_MALIGHAFI,
   HARIRI_MALIGHAFI,
   THIBITISHA_MATUMIZI,
-  TUMIA_OMBI,
-  FUNGUA_OMBI,
+  TUMA_OMBI,
+  SASISHA_OMBI,
 } from '../graphql/mutations'
 import { Card } from '../ui/Card'
 import { Btn } from '../ui/Btn'
@@ -214,13 +214,72 @@ function RangePicker({ value, onChange }) {
 
 /* ----------------------------------------------------------------- requests */
 
+// The state machine lives on the server. These are the labels it uses, mapped to
+// something a person can read, so a Swahili speaker is never shown "inasubiri".
+const HALI_MAANDISHI = {
+  imeandikwa: { jina: 'Imeandikwa', rangi: 'neutral' },
+  imetumwa: { jina: 'Imetumwa', rangi: 'neutral' },
+  inasubiri: { jina: 'Inasubiri', rangi: 'copper' },
+  inahitaji: { jina: 'Inahitaji maelezo', rangi: 'copper' },
+  imeidhinishwa: { jina: 'Imeidhinishwa', rangi: 'sage' },
+  imeanzishwa: { jina: 'Imeanzishwa', rangi: 'copper' },
+  limekubaliwa: { jina: 'Imekubaliwa', rangi: 'sage' },
+  inaendelea: { jina: 'Inaendelea', rangi: 'copper' },
+  imekamilika: { jina: 'Imekamilika', rangi: 'sage' },
+  imekataa: { jina: 'Imekataa', rangi: 'danger' },
+  imeghairi: { jina: 'Imeghairi', rangi: 'neutral' },
+}
+
+// What each role may do next, from one state. The backend refuses anything not
+// listed here, so this is a convenience rather than the rule.
+const HATUA = {
+  imeandikwa: [{ hali: 'imetumwa', jina: 'Tuma' }],
+  imetumwa: [{ hali: 'inasubiri', jina: 'Chukua' }],
+  inasubiri: [
+    { hali: 'imeidhinishwa', jina: 'Idhinisha' },
+    { hali: 'inahitaji', jina: 'Nina swali' },
+    { hali: 'imekataa', jina: 'Kataa' },
+  ],
+  inahitaji: [{ hali: 'imeandikwa', jina: 'Jibu' }],
+  imeidhinishwa: [{ hali: 'inaendelea', jina: 'Anza' }, { hali: 'imekamilika', jina: 'Kamilisha' }],
+  imeanzishwa: [{ hali: 'limekubaliwa', jina: 'Kubali' }],
+  limekubaliwa: [{ hali: 'inaendelea', jina: 'Anza' }, { hali: 'imekamilika', jina: 'Kamilisha' }],
+  inaendelea: [{ hali: 'imekamilika', jina: 'Kamilisha' }],
+}
+
+/** The moves this person could make on this record, given who they are. */
+function movesFor(o, me) {
+  const isSender = String(o.kutoka_kwa?.id) === String(me?.id)
+  const isRecipient = String(o.kwenda_kwa?.id) === String(me?.id)
+  const isOwner = me?.jukumu === 'owner'
+  const all = HATUA[o.hali] || []
+  return all.filter(({ hali }) => {
+    // The person who raised it cannot answer it themselves. Saying so here as
+    // well as on the server keeps the button off the screen, which is the point
+    // of a screen and not of a permission check.
+    if (['imeidhinishwa', 'imekataa', 'inahitaji', 'limekubaliwa'].includes(hali) && isSender && !isRecipient) {
+      return false
+    }
+    if (isOwner) return true
+    if (hali === 'imetumwa' || hali === 'imeandikwa') return isSender
+    return isRecipient
+  })
+}
+
 function RequestSheet({ open, onClose, staff, meId, preset, refetch }) {
-  const [send] = useMutation(TUMIA_OMBI, { refetchQueries: [{ query: OMBI }] })
+  const [send] = useMutation(TUMA_OMBI, { refetchQueries: [{ query: OMBI }] })
   const [to, setTo] = useState('')
   const [text, setText] = useState('')
+  const [mada, setMada] = useState('')
+  const [aina, setAina] = useState('ombi')
+  const [kipendeleo, setKipendeleo] = useState('kawaida')
+  const [malighafiId, setMalighafiId] = useState('')
+  const [kiasi, setKiasi] = useState('')
+  const [mwisho, setMwisho] = useState('')
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState('')
   const [ok, setOk] = useState('')
+  const { data: ingData } = useQuery(MALIGHAFI, { skip: !open })
 
   // Defaults to the owner, since "can we buy more of this" is nearly always
   // aimed at them, and there is no way to send a request to yourself. Re-derived
@@ -234,6 +293,12 @@ function RequestSheet({ open, onClose, staff, meId, preset, refetch }) {
     const owner = others.find((s) => s.jukumu === 'owner')
     setTo(owner ? owner.id : (others[0]?.id ?? ''))
     setText(preset || '')
+    setMada('')
+    setAina('ombi')
+    setKipendeleo('kawaida')
+    setMalighafiId('')
+    setKiasi('')
+    setMwisho('')
     setErr('')
     setOk('')
   }, [open, staff, meId, preset])
@@ -244,9 +309,25 @@ function RequestSheet({ open, onClose, staff, meId, preset, refetch }) {
     setBusy(true)
     setErr('')
     try {
-      await send({ variables: { kwenda_kwa: String(to), ujumbe: text.trim() } })
-      setOk('Ombi limetumwa.')
+      await send({
+        variables: {
+          kwenda_kwa: String(to),
+          ujumbe: text.trim(),
+          mada: mada.trim() || null,
+          aina,
+          kipendeleo,
+          // Both together or neither: a quantity with no ingredient attached is
+          // a number nobody can act on, and the server refuses it.
+          malighafi_id: malighafiId ? String(malighafiId) : null,
+          kiasi: malighafiId && kiasi ? Number(kiasi) : null,
+          mwisho: mwisho || null,
+        },
+      })
+      setOk(aina === 'direktive' ? 'Direktive imetumwa.' : 'Ombi limetumwa.')
       setText('')
+      setMada('')
+      setMalighafiId('')
+      setKiasi('')
       refetch?.()
       setTimeout(() => {
         setOk('')
@@ -260,8 +341,27 @@ function RequestSheet({ open, onClose, staff, meId, preset, refetch }) {
   }
 
   return (
-    <Modal open={open} onClose={onClose} title="Tuma Ombi">
+    <Modal open={open} onClose={onClose} title={aina === 'direktive' ? 'Toa Direktive' : 'Tuma Ombi'}>
       <form onSubmit={submit} className="flex flex-col gap-4">
+        <div className="flex gap-2">
+          {[
+            { v: 'ombi', jina: 'Ombi', maelezo: 'Unaiomba mtu afanye kitu' },
+            { v: 'direktive', jina: 'Direktive', maelezo: 'Unamwambia afanye kitu' },
+          ].map((x) => (
+            <button
+              key={x.v}
+              type="button"
+              onClick={() => setAina(x.v)}
+              className={`flex-1 rounded-2xl px-3 py-2.5 text-left transition ${
+                aina === x.v ? 'ring-2 ring-copper bg-copper/[0.06]' : 'ring-1 ring-espresso/10'
+              }`}
+            >
+              <span className="block text-sm font-semibold text-espresso">{x.jina}</span>
+              <span className="block text-[11px] text-espresso-muted">{x.maelezo}</span>
+            </button>
+          ))}
+        </div>
+
         <Select label="Mpelekee" required value={to} onChange={(e) => setTo(e.target.value)}>
           <option value="">— Chagua —</option>
           {(staff || [])
@@ -272,65 +372,148 @@ function RequestSheet({ open, onClose, staff, meId, preset, refetch }) {
               </option>
             ))}
         </Select>
+
+        <FieldSquare
+          label="Mada"
+          value={mada}
+          onChange={(e) => setMada(e.target.value)}
+          placeholder="Short one line, e.g. Cream ya kupenga"
+        />
+
         <TextArea
           label="Ujumbe"
           required
-          rows={4}
+          rows={3}
           value={text}
           onChange={(e) => setText(e.target.value)}
           placeholder="Cream ya kupenga imeisha. Tunaweza kununua lita 6?"
         />
+
+        <Select label="Malighafi (hiari)" value={malighafiId} onChange={(e) => setMalighafiId(e.target.value)}>
+          <option value="">— Si ya malighafi —</option>
+          {(ingData?.malighafi || []).map((m) => (
+            <option key={m.id} value={m.id}>
+              {m.jina}
+            </option>
+          ))}
+        </Select>
+
+        {malighafiId && (
+          <FieldSquare
+            label="Kiasi"
+            type="number"
+            min="0"
+            step="0.01"
+            value={kiasi}
+            onChange={(e) => setKiasi(e.target.value)}
+            placeholder="6"
+          />
+        )}
+
+        <div className="flex gap-3">
+          <Select label="Kipendeleo" value={kipendeleo} onChange={(e) => setKipendeleo(e.target.value)}>
+            <option value="kawaida">Kawaida</option>
+            <option value="haraka">Haraka</option>
+            <option value="chakati">Chakati</option>
+          </Select>
+          <FieldSquare label="Mwisho" type="date" value={mwisho} onChange={(e) => setMwisho(e.target.value)} />
+        </div>
+
         {err && <p className="text-xs font-medium text-red-500 text-center">{err}</p>}
         {ok && <p className="text-xs font-medium text-sage-deep text-center">{ok}</p>}
         <Btn type="submit" variant="accent" size="lg" icon={PaperPlaneTilt} disabled={busy} className="w-full">
-          {busy ? 'Inatuma...' : 'Tuma'}
+          {busy ? 'Inatuma...' : aina === 'direktive' ? 'Tuma Direktive' : 'Tuma Ombi'}
         </Btn>
       </form>
     </Modal>
   )
 }
 
-function RequestRow({ o, actionable, replying, onReply, onCancel, onSubmit, draft, setDraft, busy }) {
+function RequestRow({ o, me, moving, onMove, onCancel, draft, setDraft, busy }) {
+  const hali = HALI_MAANDISHI[o.hali] || { jina: o.hali, rangi: 'neutral' }
+  const moves = movesFor(o, me)
+  const [expanded, setExpanded] = useState(false)
+
   return (
     <div className="rounded-2xl bg-espresso/[0.03] px-4 py-3.5">
       <div className="flex items-start justify-between gap-3 flex-wrap">
         <div className="min-w-0">
-          <p className="text-sm font-semibold text-espresso leading-snug">{o.ujumbe}</p>
-          <p className="text-[11px] text-espresso-muted mt-0.5">
+          <div className="flex items-center gap-1.5 flex-wrap">
+            {o.aina === 'direktive' && (
+              <Badge color="copper">Direktive</Badge>
+            )}
+            {o.imeishia_muda && <Badge color="danger">Imepitwa na muda</Badge>}
+          </div>
+          <p className="text-sm font-semibold text-espresso leading-snug mt-1">
+            {o.mada || o.ujumbe}
+          </p>
+          {o.mada && o.ujumbe !== o.mada && (
+            <p className="text-[12px] text-espresso-muted mt-0.5 leading-snug">{o.ujumbe}</p>
+          )}
+          <p className="text-[11px] text-espresso-muted mt-1">
             {o.kutoka_kwa?.jina} → {o.kwenda_kwa?.jina} · {new Date(o.created_at).toLocaleString('sw')}
+            {o.malighafi && ` · ${o.malighafi.jina}${o.kiasi ? ` ${o.kiasi}` : ''}`}
+            {o.mwisho && ` · mwisho ${o.mwisho}`}
           </p>
         </div>
-        <Badge color={o.hali === 'fungua' ? 'copper' : 'sage'}>
-          {o.hali === 'fungua' ? 'Wazi' : 'Imefanyika'}
-        </Badge>
+        <Badge color={hali.rangi}>{hali.jina}</Badge>
       </div>
+
       {o.jibu && (
         <p className="text-[12px] text-espresso bg-sage/[0.07] rounded-xl px-3 py-2 mt-2.5">
           <span className="font-semibold">Jibu:</span> {o.jibu}
+          {o.alizokamilisha_na && (
+            <span className="text-espresso-muted"> — {o.alizokamilisha_na.jina}</span>
+          )}
         </p>
       )}
-      {actionable && o.hali === 'fungua' && (
+
+      {o.historia?.length > 0 && (
+        <button
+          type="button"
+          onClick={() => setExpanded((v) => !v)}
+          className="mt-2 text-[11px] font-medium text-espresso-muted hover:text-espresso"
+        >
+          {expanded ? 'Ficha historia' : `Historia (${o.historia.length})`}
+        </button>
+      )}
+
+      {expanded && (
+        <ol className="mt-2 space-y-1 border-l-2 border-espresso/10 pl-3">
+          {o.historia.map((h, i) => (
+            <li key={i} className="text-[11px] text-espresso-muted">
+              {(HALI_MAANDISHI[h.hali] || { jina: h.hali }).jina}
+              {h.aliyefanya && ` — ${h.aliyefanya.jina}`}
+              {` · ${new Date(h.tarehe).toLocaleString('sw')}`}
+            </li>
+          ))}
+        </ol>
+      )}
+
+      {moves.length > 0 && (
         <div className="flex items-end gap-2 mt-3 flex-wrap">
-          {replying ? (
+          {moving ? (
             <>
               <input
                 autoFocus
-                placeholder="Jibu lako (si lazima)"
+                placeholder="Jibu (si lazima)"
                 value={draft}
                 onChange={(e) => setDraft(e.target.value)}
                 className="flex-1 min-w-[12rem] rounded-xl bg-white ring-1 ring-espresso/10 px-3 py-2 text-sm"
               />
-              <Btn variant="accent" size="md" icon={Check} disabled={busy} onClick={onSubmit}>
-                {busy ? 'Inahifadhi...' : 'Funga'}
+              <Btn variant="accent" size="md" icon={Check} disabled={busy} onClick={onMove}>
+                {busy ? 'Inahifadhi...' : 'Hifadhi'}
               </Btn>
               <Btn variant="ghost" size="md" icon={X} onClick={onCancel}>
                 Ghairi
               </Btn>
             </>
           ) : (
-            <Btn variant="ghost" size="md" icon={ChatCircle} onClick={onReply}>
-              Jibu na funga
-            </Btn>
+            moves.map((mv) => (
+              <Btn key={mv.hali} variant="ghost" size="md" icon={ChatCircle} onClick={() => onMove(mv.hali)}>
+                {mv.jina}
+              </Btn>
+            ))
           )}
         </div>
       )}
@@ -340,28 +523,29 @@ function RequestRow({ o, actionable, replying, onReply, onCancel, onSubmit, draf
 
 function OmbiTab({ me, staff }) {
   const { data, loading, refetch } = useQuery(OMBI)
-  const [close] = useMutation(FUNGUA_OMBI, { refetchQueries: [{ query: OMBI }] })
+  const [move] = useMutation(SASISHA_OMBI, { refetchQueries: [{ query: OMBI }] })
   const [sheet, setSheet] = useState(false)
-  const [replying, setReplying] = useState(null)
+  const [moving, setMoving] = useState(null)
   const [draft, setDraft] = useState('')
   const [busy, setBusy] = useState(false)
 
   const all = data?.ombi || []
-  const canClose = (o) => String(o.kwenda_kwa?.id) === String(me?.id) || me?.jukumu === 'owner'
-  const forMe = all.filter((o) => o.hali === 'fungua' && canClose(o))
-  const fromMe = all.filter((o) => String(o.kutoka_kwa?.id) === String(me?.id))
-  const done = all.filter((o) => o.hali === 'imefanyika' && canClose(o))
+  const isMine = (o) => String(o.kutoka_kwa?.id) === String(me?.id)
+  const forMe = all.filter((o) => o.hai && String(o.kwenda_kwa?.id) === String(me?.id))
+  const fromMe = all.filter(isMine)
+  const done = all.filter((o) => !o.hai)
 
-  const startReply = (o) => {
-    setReplying(o.id)
+  const startMove = (o, hali) => {
+    setMoving({ id: o.id, hali })
     setDraft('')
   }
 
-  const answer = async (o) => {
+  const answer = async () => {
+    if (!moving) return
     setBusy(true)
     try {
-      await close({ variables: { id: String(o.id), jibu: draft.trim() || null } })
-      setReplying(null)
+      await move({ variables: { id: String(moving.id), hali: moving.hali, jibu: draft.trim() || null } })
+      setMoving(null)
       setDraft('')
       refetch()
     } catch (e) {
@@ -402,11 +586,10 @@ function OmbiTab({ me, staff }) {
             <RequestRow
               key={o.id}
               o={o}
-              actionable
-              replying={replying === o.id}
-              onReply={() => startReply(o)}
-              onCancel={() => setReplying(null)}
-              onSubmit={() => answer(o)}
+              me={me}
+              moving={moving?.id === o.id}
+              onMove={(hali) => startMove(o, hali)}
+              onCancel={() => setMoving(null)}
               draft={draft}
               setDraft={setDraft}
               busy={busy}
@@ -421,7 +604,17 @@ function OmbiTab({ me, staff }) {
             Maombi yako ({fromMe.length})
           </h3>
           {fromMe.map((o) => (
-            <RequestRow key={o.id} o={o} />
+            <RequestRow
+              key={o.id}
+              o={o}
+              me={me}
+              moving={moving?.id === o.id}
+              onMove={(hali) => startMove(o, hali)}
+              onCancel={() => setMoving(null)}
+              draft={draft}
+              setDraft={setDraft}
+              busy={busy}
+            />
           ))}
         </section>
       )}
@@ -429,10 +622,10 @@ function OmbiTab({ me, staff }) {
       {done.length > 0 && (
         <section className="flex flex-col gap-2.5">
           <h3 className="text-xs font-semibold uppercase tracking-wider text-espresso-muted">
-            Yamekamilika ({done.length})
+            Zimefungwa ({done.length})
           </h3>
           {done.slice(0, 10).map((o) => (
-            <RequestRow key={o.id} o={o} />
+            <RequestRow key={o.id} o={o} me={me} />
           ))}
         </section>
       )}

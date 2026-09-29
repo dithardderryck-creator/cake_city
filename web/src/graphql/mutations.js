@@ -202,14 +202,46 @@ export const PANGA_KATEGORIA = gql`
 
 // --- Staff requests --------------------------------------------------------
 
-export const TUMIA_OMBI = gql`
-  mutation TumiaOmbi($kwenda_kwa: ID!, $ujumbe: String!) {
-    tumia_ombi(kwenda_kwa: $kwenda_kwa, ujumbe: $ujumbe) { id ujumbe hali }
+/**
+ * One mutation raises either a request or a directive; `aina` says which way the
+ * intent points. Linking the ingredient and a quantity is what makes a
+ * procurement request able to drive a reorder rather than sitting as prose.
+ */
+export const TUMA_OMBI = gql`
+  mutation TumaOmbi(
+    $kwenda_kwa: ID!, $ujumbe: String!, $mada: String
+    $aina: AinaUkumbushoKazi, $kipendeleo: KipendeleoUkumbushoKazi
+    $malighafi_id: ID, $kiasi: Float, $agizo_id: ID, $mwisho: Date
+  ) {
+    tuma_ombi(input: {
+      kwenda_kwa: $kwenda_kwa, ujumbe: $ujumbe, mada: $mada
+      aina: $aina, kipendeleo: $kipendeleo
+      malighafi_id: $malighafi_id, kiasi: $kiasi
+      agizo_id: $agizo_id, mwisho: $mwisho
+    }) { id mada ujumbe aina kipendeleo kiasi mwisho hali }
   }
 `
 
-export const FUNGUA_OMBI = gql`
-  mutation FungaOmbi($id: ID!, $jibu: String) {
-    fungua_ombi(id: $id, jibu: $jibu) { id hali jibu }
+/**
+ * Move a request or directive to a new state. The backend owns which moves are
+ * legal, so the client sends the state it wants and is told "no" when that move
+ * does not exist. That is deliberate: a screen that hides an illegal button still
+ * has to be safe when the button is pressed anyway.
+ */
+export const SASISHA_OMBI = gql`
+  mutation SasisbaOmbi($id: ID!, $hali: HaliOmbi!, $jibu: String) {
+    sasisha_ombi(id: $id, hali: $hali, jibu: $jibu) { id hali jibu alizokamilisha_at }
+  }
+`
+
+export const KAMILISHA_OMBI = gql`
+  mutation KamilishaOmbi($id: ID!, $jibu: String) {
+    kamilisha_ombi(id: $id, jibu: $jibu) { id hali jibu alizokamilisha_at }
+  }
+`
+
+export const GHAIRI_OMBI = gql`
+  mutation GhairiOmbi($id: ID!, $sababu: String) {
+    ghairi_ombi(id: $id, sababu: $sababu) { id hali jibu }
   }
 `

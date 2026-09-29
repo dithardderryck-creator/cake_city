@@ -2,7 +2,6 @@ import { useState } from 'react'
 import { useQuery, useMutation } from '@apollo/client'
 import { BIDHAA, MAUZO_YA_LEO, AGIZO_MAALUM, UKUMBUSHO } from '../graphql/queries'
 import { UNDA_MAUZO, UNDA_AGIZO, CHUKUA_AGIZO } from '../graphql/mutations'
-import { MAPISHI } from '../graphql/queries'
 import { Card, CardFull } from '../ui/Card'
 import { Btn } from '../ui/Btn'
 import { Field, FieldSquare } from '../ui/Field'
@@ -237,10 +236,8 @@ function SalesTab() {
 
 function OrderTab() {
   const [undaaGizo] = useMutation(UNDA_AGIZO)
-  const { data: mapishiData } = useQuery(MAPISHI)
   const [form, setForm] = useState({
     jina: '', simu: '', mzio: '', ladha: '', design: '', ukubwa: '', umbo: '',
-    maelekezo: '', mapishi_id: '', tarehe: '', bei: '', amali: '',
   })
   const [busy, setBusy] = useState(false)
   const [orderResult, setOrderResult] = useState(null)
@@ -280,7 +277,6 @@ function OrderTab() {
             ukubwa: form.ukubwa || undefined,
             umbo: form.umbo || undefined,
             maelekezo_maalum: form.maelekezo || undefined,
-            mapishi_id: form.mapishi_id || null,
             tarehe_ya_kuchukua: form.tarehe,
             bei_jumla: Number(form.bei),
             malipo_ya_awali: Number(form.amali) || 0,
@@ -291,7 +287,7 @@ function OrderTab() {
       setOrderResult(data.unda_agizo)
       setForm({
         jina: '', simu: '', mzio: '', ladha: '', design: '', ukubwa: '', umbo: '',
-        maelekezo: '', mapishi_id: '', tarehe: '', bei: '', amali: '',
+        maelekezo: '', tarehe: '', bei: '', amali: '',
       })
       setPayMode('nusuri')
     } catch (err) {
@@ -300,8 +296,6 @@ function OrderTab() {
     finally { setBusy(false) }
   }
 
-  // Only active recipes reach the client, so this list is always valid.
-  const recipes = mapishiData?.mapishi || []
   const beiNum = Number(form.bei) || 0
   const amaliNum = Number(form.amali) || 0
   const salio = beiNum - amaliNum
@@ -337,40 +331,12 @@ function OrderTab() {
             <Field label="Umbo" value={form.umbo} onChange={(e) => update('umbo', e.target.value)} placeholder="Round, heart, square..." />
             <Field label="Maelekezo maalum" value={form.maelekezo} onChange={(e) => update('maelekezo', e.target.value)} placeholder="Mafupi, rangi, ujumbe..." />
           </div>
-          {/* Picking a recipe is what lets the kitchen prefill its tap sheet.
-              It is optional: leave it blank and the order is treated as off-book. */}
-          <div className="mt-3">
-            <Select
-              label="Mapishi (si lazima)"
-              value={form.mapishi_id}
-              onChange={(e) => {
-                const id = e.target.value
-                const rec = recipes.find((r) => String(r.id) === id)
-                // Carry the recipe's own name/size across so the order and the
-                // kitchen sheet cannot drift apart.
-                setForm((f) => ({
-                  ...f,
-                  mapishi_id: id,
-                  ladha: rec ? rec.ladha : f.ladha,
-                  ukubwa: rec ? rec.ukubwa : f.ukubwa,
-                }))
-              }}
-            >
-              <option value="">— Hakuna mapishi —</option>
-              {recipes.map((r) => (
-                <option key={r.id} value={r.id}>
-                  {r.ladha} — {r.ukubwa}
-                  {r.mapamba_variant === 'fraction_of' ? ' (sehemu)' : ''}
-                </option>
-              ))}
-            </Select>
-            <p className="text-[11px] text-espresso-muted mt-1">
-              {form.mapishi_id
-                ? 'Jikoni litatafanya kazi na viambato hivi.'
-                : 'Jikoni litatambua malighafi yenyewe.'}
-            </p>
-          </div>
-          <FieldSquare label="Muundo (Design)" value={form.design} onChange={(e) => update('design', e.target.value)} placeholder="Maelezo ya muundo..." />
+             {/* No recipe picker, deliberately. Flavour and size above are the
+                 whole of what the cashier knows about this cake; which internal
+                 recipe it maps to is the backend's decision, made in unda_agizo.
+                 An order that matches nothing is a real outcome and is recorded
+                 as off-book, which the kitchen handles without a suggestion. */}
+             <FieldSquare label="Muundo (Design)" value={form.design} onChange={(e) => update('design', e.target.value)} placeholder="Maelezo ya muundo..." />
             <div className="grid grid-cols-2 gap-3">
               <FieldSquare label="Tarehe ya kuchukua" type="date" required value={form.tarehe} onChange={(e) => update('tarehe', e.target.value)} />
               <FieldSquare label="Bei (TSh)" type="number" min="0" required value={form.bei} onChange={(e) => { update('bei', e.target.value); if (payMode === 'kamili') update('amali', e.target.value) }} placeholder="80000" />

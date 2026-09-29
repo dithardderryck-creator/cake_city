@@ -225,11 +225,22 @@ export const KATEGORIA = gql`
   }
 `
 
-/** Both directions, so you can see what you sent as well as what came in. */
+/**
+ * What the signed-in person is allowed to see: what they sent and what came in
+ * to them, or everything if they are the owner. The backend filters, so the list
+ * cannot be widened by asking nicely.
+ */
 export const OMBI = gql`
-  query Ombi {
-    ombi { id ujumbe jibu hali created_at tarehe_ya_kufunguliwa
-           kutoka_kwa { id jina jukumu }
-           kwenda_kwa { id jina jukumu } }
+  query Ombi($fungua: Boolean, $aina: AinaUkumbushoKazi) {
+    ombi(fungua: $fungua, aina: $aina) {
+      id mada ujumbe jibu aina kipendeleo kiasi mwisho
+      hali hai imeishia_muda created_at tarehe_ya_kufunguliwa
+      kutoka_kwa { id jina jukumu }
+      kwenda_kwa { id jina jukumu }
+      alizokamilisha_na { id jina jukumu }
+      malighafi { id jina }
+      agizo { id ladha umbo }
+      historia { hali ujumbe tarehe aliyefanya { id jina } }
+    }
   }
 `

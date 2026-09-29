@@ -459,7 +459,309 @@ const raiseUsageConfirmation = async (client, sheetId, raisedBy, agizoId, lineCo
  * it directly with toa_bei, so the request is simply skipped rather than
  * failing the order.
  */
+/**
+ * BR-11: freeze a combination onto an order line.
+ *
+ * Returns the four things a line records and the catalogue stops owning: the
+ * name as it reads today, the chosen options in axis order, the union of their
+ * allergens, and the price the owner set. Everything is read here, once, and
+ * written onto the line. Nothing on the line is ever re-read from the
+ * combination afterwards.
+ *
+ * That is the whole point. The owner renames a size, corrects an allergen, or
+ * re-prices a combination next month; the order that used it must keep saying
+ * "8-inch, Vanilla cream, mayai, 45000" exactly as it did. Without this, history
+ * is not history, it is a live query against whatever the catalogue is today.
+ *
+ * The options are ordered by axis attachment order rather than by value id, so
+ * the line reads the way the owner built the grid: "Chocolate Fudge, 8-inch,
+ * Vanilla cream" rather than the options in an arbitrary sequence.
+ */
+const freezeCombination = async (client, mchanganyikoId) => {
+  const m = (
+    await client.query('SELECT * FROM mchanganyiko WHERE id = $1', [mchanganyikoId])
+  ).rows[0];
+  if (!m) {
+    throw new GraphQLError('Mchanganyiko hakupatikani.', { extensions: { code: 'NOT_FOUND' } });
+  }
+  // One row per value, ordered by the order the axes were attached to the
+  // product, then by the value within each axis. The correlated subquery finds
+  // this product's position for the value's axis; the join is what makes a value
+  // shared across two products still order correctly against each one.
+  const { rows: values } = await client.query(
+    `SELECT t.jina, t.viambisho,
+            (SELECT MIN(kk.nafasi)
+               FROM chagizo_kundi_kazi kk
+              WHERE kk.bidhaa_id = $2 AND kk.kundi_id = t.kundi_id) AS nafasi
+       FROM mchanganyiko_thamani mt
+       JOIN chagizo_thamani t ON t.id = mt.thamani_id
+      WHERE mt.mchanganyiko_id = $1
+      ORDER BY nafasi NULLS LAST, t.id`,
+    [mchanganyikoId, m.bidhaa_id]
+  );
+  const chaguo = values.map((v) => v.jina);
+  // Union of allergens, sorted and deduped, so two values listing "mayai" between
+  // them produce one entry. This is a safety list: a duplicate or a gap is
+  // worse than untidy, and this is what the kitchen and the customer read.
+  const viambisho = [...new Set(values.flatMap((v) => v.viambisho || []))].sort();
+  return {
+    mchanganyiko_id: mchanganyikoId,
+    bidhaa_id: m.bidhaa_id,
+    jina: m.maelezo,
+    chaguo,
+    viambisho,
+    bei: m.bei,
+    uteuzi_mchanganyiko: m.status,
+  };
+};
+
+// BR-26: draw the next order number for a device. Thin wrapper on the SQL
+// function, kept here so the format lives in one place — the prefix, the dash,
+// and the sequence are all decided in one spot rather than at each call site.
+const kifaaChukuaNamba = async (client, kifaaId) =>
+  (await client.query('SELECT kifaa_chukua_namba($1) AS n', [kifaaId])).rows[0].n;
+
+/** Sum of line totals and how many still need a quote (bei <= 0). */
+const sumKipimoBei = async (client, agizoId) => {
+  const { rows } = await client.query(
+    `SELECT COALESCE(SUM(bei * kiasi), 0)::float AS total,
+            COUNT(*) FILTER (WHERE bei <= 0)::int AS bado,
+            COUNT(*)::int AS n
+       FROM agizo_kipimo WHERE agizo_id = $1`,
+    [agizoId]
+  );
+  return { total: Number(rows[0].total), bado: rows[0].bado, n: rows[0].n };
+};
+
+/**
+ * Build the row values for one order line. Catalogue prices come from the live
+ * combination (BR-02); custom lines start at 0 until the owner quotes (BR-05).
+ */
+const buildKipimoCols = async (client, input) => {
+  const kiasi = Number(input.kiasi || 1);
+  if (!Number.isInteger(kiasi) || kiasi <= 0) {
+    throw new GraphQLError('Kiasi lazima iwe namba nzima zaidi ya sifuri.', {
+      extensions: { code: 'BAD_REQUEST' },
+    });
+  }
+  if (input.aina === 'katalogi') {
+    if (!input.mchanganyiko_id) {
+      throw new GraphQLError('Chagua mchanganyiko.', { extensions: { code: 'BAD_REQUEST' } });
+    }
+    const snap = await freezeCombination(client, input.mchanganyiko_id);
+    if (snap.uteuzi_mchanganyiko !== 'patikana') {
+      throw new GraphQLError('Mchanganyiko huo haupatikani kwa sasa.', {
+        extensions: { code: 'CONFLICT' },
+      });
+    }
+    if (!(Number(snap.bei) > 0)) {
+      throw new GraphQLError('Mchanganyiko huo bado hajauni bei.', {
+        extensions: { code: 'CONFLICT' },
+      });
+    }
+    // Availability gate: refuse to put more on an order than the counter holds.
+    // Stock is decremented at collect (chukua_agizo), under the same lock.
+    const stock = (
+      await client.query('SELECT hesafa FROM mchanganyiko WHERE id = $1 FOR UPDATE', [
+        input.mchanganyiko_id,
+      ])
+    ).rows[0];
+    if (!stock || Number(stock.hesafa) < kiasi) {
+      throw new GraphQLError('Hisa haitoshi kwa mchanganyiko huo.', {
+        extensions: { code: 'CONFLICT' },
+      });
+    }
+    return { aina: 'katalogi', ...snap, kiasi };
+  }
+  return {
+    aina: 'custom',
+    mchanganyiko_id: null,
+    bidhaa_id: null,
+    jina: (input.maelezo || '').trim() || (input.ladha_za_chakula || '').trim() || 'Kekea maalum',
+    chaguo: [],
+    viambisho: [],
+    bei: 0,
+    kiasi,
+    kimo: input.kimo || null,
+    ladha_za_chakula: input.ladha_za_chakula || null,
+    kijazi: input.kijazi || null,
+    tabaka: input.tabaka ?? null,
+    mzabibu: input.mzabibu || null,
+    maelezo: (input.maelezo || '').trim() || null,
+  };
+};
+
+const insertKipimoRow = async (client, agizoId, cols) => {
+  const { rows } = await client.query(
+    `INSERT INTO agizo_kipimo
+       (agizo_id, aina, mchanganyiko_id, bidhaa_id, jina, chaguo, viambisho, bei, kiasi,
+        kimo, ladha_za_chakula, kijazi, tabaka, mzabibu, maelezo)
+     VALUES ($1, $2::aina_ya_kipimo, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+     RETURNING *`,
+    [
+      agizoId,
+      cols.aina,
+      cols.mchanganyiko_id,
+      cols.bidhaa_id,
+      cols.jina,
+      cols.chaguo,
+      cols.viambisho,
+      cols.bei,
+      cols.kiasi,
+      cols.kimo ?? null,
+      cols.ladha_za_chakula ?? null,
+      cols.kijazi ?? null,
+      cols.tabaka ?? null,
+      cols.mzabibu ?? null,
+      cols.maelezo ?? null,
+    ]
+  );
+  return rows[0];
+};
+
+/**
+ * Keep agizo_maalum.bei_jumla and hali in step with the lines. Line prices are
+ * the source of truth; the order total is always SUM(bei * kiasi).
+ */
+const syncOrderFromLines = async (client, agizoId, { raisedBy, mtejaJina } = {}) => {
+  const { total, bado, n } = await sumKipimoBei(client, agizoId);
+  if (n < 1) {
+    throw new GraphQLError('Agizo lazima liwe na angalau kipimo kimoja.', {
+      extensions: { code: 'BAD_REQUEST' },
+    });
+  }
+  const order = (
+    await client.query('SELECT * FROM agizo_maalum WHERE id = $1 FOR UPDATE', [agizoId])
+  ).rows[0];
+  if (!order) {
+    throw new GraphQLError('Agizo halipo.', { extensions: { code: 'NOT_FOUND' } });
+  }
+  if (['collected', 'cancelled'].includes(order.hali)) {
+    throw new GraphQLError('Agizo uliokamilika hauwezi kubadilishwa.', {
+      extensions: { code: 'CONFLICT' },
+    });
+  }
+
+  // Paid money is already in the ledger. Shrinking the order below what was
+  // taken would leave a negative salio and trip the deposit_not_over_total
+  // check with a raw DB error — refuse with a clear message instead.
+  const alreadyPaid = Number(order.malipo_ya_awali) || 0;
+  if (total + 0.009 < alreadyPaid) {
+    throw new GraphQLError(
+      `Jumla mpya (TSh ${Math.round(total)}) ni ndogo kuliko malipo yaliyotolewa (TSh ${Math.round(alreadyPaid)}). Ondoa malipo au ongeza vipimo.`,
+      { extensions: { code: 'CONFLICT', bei_jumla: total, malipo_ya_awali: alreadyPaid } }
+    );
+  }
+
+  let hali = order.hali;
+  let ombiBei = null;
+  const wasAwaiting = hali === 'awaiting_quote';
+  if (bado > 0) {
+    if (hali !== 'awaiting_quote') {
+      hali = 'awaiting_quote';
+      if (raisedBy != null) {
+        ombiBei = await raiseQuoteRequest(client, agizoId, raisedBy, mtejaJina);
+      }
+      // Kitchen must not bake an unpriced order. Pull open tickets off the board
+      // until the quote lands; toa_bei / the leave path re-queues them.
+      await client.query(
+        `UPDATE tikiti SET hali = 'cancelled', updated_at = NOW()
+          WHERE agizo_id = $1 AND hali IN ('in_queue', 'preparing', 'ready')`,
+        [agizoId]
+      );
+    }
+  } else if (hali === 'awaiting_quote') {
+    hali = 'ordered';
+    await client.query(
+      `UPDATE ombi
+          SET hali = 'imekamilika',
+              jibu = COALESCE(jibu, 'Bei imetolewa kutoka vipimo'),
+              alizokamilisha_at = now(),
+              tarehe_ya_kufunguliwa = now()
+        WHERE agizo_id = $1
+          AND jukumu_anayehudumiwa = 'owner'
+          AND hali NOT IN ('imekamilika', 'imekataa', 'imeghairi')`,
+      [agizoId]
+    );
+  }
+
+  const { rows } = await client.query(
+    `UPDATE agizo_maalum
+        SET bei_jumla = $2, hali = $3::order_status, updated_at = NOW()
+      WHERE id = $1 RETURNING *`,
+    [agizoId, total, hali]
+  );
+
+  // Leaving awaiting_quote by removing the last unpriced line (not via toa_bei)
+  // must put the kitchen back on the board if nothing is queued.
+  if (wasAwaiting && hali === 'ordered') {
+    const open = (
+      await client.query(
+        `SELECT id FROM tikiti
+          WHERE agizo_id = $1 AND hali IN ('in_queue', 'preparing', 'ready')
+          LIMIT 1`,
+        [agizoId]
+      )
+    ).rows[0];
+    if (!open) {
+      await tikitishaAgizo(client, {
+        agizo_id: agizoId,
+        jumla: total,
+        maelezo: `${rows[0].ladha}${rows[0].ukubwa ? ` — ${rows[0].ukubwa}` : ''}`,
+        jina: mtejaJina,
+      });
+    }
+  }
+
+  return { agizo: rows[0], total, bado, ombiBei };
+};
+
+/** Decrement catalogue stock for every catalogue line on collect. */
+const decrementStockForOrder = async (client, agizoId) => {
+  const { rows: lines } = await client.query(
+    `SELECT id, mchanganyiko_id, kiasi, aina FROM agizo_kipimo
+      WHERE agizo_id = $1 ORDER BY id FOR UPDATE`,
+    [agizoId]
+  );
+  for (const line of lines) {
+    if (line.aina !== 'katalogi') continue;
+    if (!line.mchanganyiko_id) {
+      throw new GraphQLError('Kipimo cha katalogi hakina mchanganyiko — hisa haiwezi kushushwa.', {
+        extensions: { code: 'CONFLICT', kipimo_id: line.id },
+      });
+    }
+    const updated = (
+      await client.query(
+        `UPDATE mchanganyiko
+            SET hesafa = hesafa - $2
+          WHERE id = $1 AND hesafa >= $2
+          RETURNING id, hesafa`,
+        [line.mchanganyiko_id, line.kiasi]
+      )
+    ).rows[0];
+    if (!updated) {
+      throw new GraphQLError('Hisa haitoshi wakati wa kuchukua agizo.', {
+        extensions: { code: 'CONFLICT', mchanganyiko_id: line.mchanganyiko_id },
+      });
+    }
+  }
+};
+
 const raiseQuoteRequest = async (client, agizoId, raisedBy, mtejaJina) => {
+  // One open quote request per order — adding another custom line must not spam
+  // the owner with duplicates.
+  const open = (
+    await client.query(
+      `SELECT id FROM ombi
+        WHERE agizo_id = $1
+          AND jukumu_anayehudumiwa = 'owner'
+          AND hali NOT IN ('imekamilika', 'imekataa', 'imeghairi')
+        LIMIT 1`,
+      [agizoId]
+    )
+  ).rows[0];
+  if (open) return open;
+
   const to = (
     await client.query(
       `SELECT id FROM mtumiaji WHERE jukumu = 'owner' AND active ORDER BY id LIMIT 1`
@@ -742,7 +1044,40 @@ const resolvers = {
   DateTime: DateTimeScalar,
   JSON: JSONScalar,
 
+  AgizoKipimo: {
+    mchanganyiko: async (line) => {
+      if (!line.mchanganyiko_id) return null;
+      const { rows } = await pool.query('SELECT * FROM mchanganyiko WHERE id = $1', [
+        line.mchanganyiko_id,
+      ]);
+      return rows[0] || null;
+    },
+  },
+
   AgizoMaalum: {
+    // BR-01: the order's lines, in the order they were added.
+    kipimo: async (order) => {
+      const { rows } = await pool.query(
+        'SELECT * FROM agizo_kipimo WHERE agizo_id = $1 ORDER BY id',
+        [order.id]
+      );
+      return rows;
+    },
+    // A-07: true while any line still has bei <= 0 (unquoted custom).
+    kipimo_bado: async (order) => {
+      const { rows } = await pool.query(
+        'SELECT count(*)::int AS n FROM agizo_kipimo WHERE agizo_id = $1 AND bei <= 0',
+        [order.id]
+      );
+      return rows[0].n > 0;
+    },
+    ina_katalogi_na_custom: async (order) => {
+      const { rows } = await pool.query(
+        `SELECT count(DISTINCT aina)::int AS n FROM agizo_kipimo WHERE agizo_id = $1`,
+        [order.id]
+      );
+      return rows[0].n > 1;
+    },
     mapishi: async (order) => {
       // A NULL mapishi_id IS the custom/off-book flag, so this stays nullable
       // rather than throwing — the kitchen needs to see "no recipe, start empty".
@@ -1854,7 +2189,7 @@ const resolvers = {
   },
 
   Mutation: {
-    login: async (_, { id, pin }, ctx) => {
+    login: async (_, { id, pin, kifaa }, ctx) => {
       // A1: lock out both the account and the source IP after repeated
       // failures, so 4-digit PINs cannot be ground from either direction.
       const ip = (ctx.req && (ctx.req.ip || ctx.req.socket?.remoteAddress)) || 'unknown';
@@ -1890,10 +2225,35 @@ const resolvers = {
 
       clear(accountKey);
       clear(ipKey);
-      const token = signToken(u);
+      // BR-26: this till identifies itself once, at login, and the claim rides in
+      // the token from then on. Claiming it per request instead would let a
+      // client ask for another device's prefix, and two tills would then share a
+      // sequence — which is the exact collision the prefix exists to prevent.
+      //
+      // Omitting kifaa is allowed (orders get a null number until the till is
+      // registered). Naming a prefix that is not active is refused — better a
+      // clear setup error than silently issuing unnumbered orders while the
+      // panel thinks it is on a till.
+      let kifaaRow = null;
+      if (kifaa) {
+        kifaaRow = (
+          await pool.query('SELECT * FROM kifaa WHERE alama = $1 AND active', [
+            String(kifaa).trim().toUpperCase(),
+          ])
+        ).rows[0] || null;
+        if (!kifaaRow) {
+          throw new GraphQLError('Kifaa hakijasajiliwa au si active.', {
+            extensions: { code: 'NOT_FOUND' },
+          });
+        }
+      }
+      const token = signToken({ ...u, kifaa_id: kifaaRow?.id || null, kifaa_alama: kifaaRow?.alama || null });
       return {
         token,
         mtumiaji: { id: u.id, jina: u.jina, jukumu: u.jukumu, active: true },
+        // BR-26: which till this session is on, so the panel can show it in
+        // settings and an owner can see who is issuing order numbers.
+        kifaa: kifaaRow,
       };
     },
 
@@ -2008,6 +2368,36 @@ const resolvers = {
          VALUES ($1, $2, $3, $4) RETURNING *`,
         [input.kundi_id, input.jina, viambisho, ctx.user.sub]
       );
+      return rows[0];
+    },
+
+    // Correcting a value the owner got wrong. The name and the allergens are the
+    // two things a person is likely to have got wrong, and a library with no way
+    // to correct them is a library that accumulates near-duplicates instead.
+    //
+    // It changes what the catalogue says from now on, and nothing else. The
+    // combinations already using this value keep whatever it said when they were
+    // ordered, because every order line holds a frozen copy of its own name and
+    // allergens (BR-11). Rewriting history here would defeat exactly the thing
+    // that makes the snapshot worth having.
+    hariri_thamani: async (_, { id, input }, ctx) => {
+      requireCan(ctx.user, 'product.manage');
+      const jina = (input.jina || '').trim();
+      if (!jina) {
+        throw new GraphQLError('Jina la thamani halihitajiki.', {
+          extensions: { code: 'BAD_REQUEST' },
+        });
+      }
+      const viambisho = [
+        ...new Set((input.viambisho || []).map((a) => String(a).trim()).filter(Boolean)),
+      ].sort();
+      const { rows } = await pool.query(
+        'UPDATE chagizo_thamani SET jina = $2, viambisho = $3 WHERE id = $1 RETURNING *',
+        [id, jina, viambisho]
+      );
+      if (!rows[0]) {
+        throw new GraphQLError('Thamani haipo.', { extensions: { code: 'NOT_FOUND' } });
+      }
       return rows[0];
     },
 
@@ -2210,7 +2600,15 @@ const resolvers = {
         });
       }
       const { rows } = await pool.query(
-        `UPDATE mchanganyiko SET bei = $2 WHERE id = ANY($1::int[]) RETURNING *`,
+        // Pricing is the owner's "this is for sale" act (D-27). Combinations
+        // are born haipatikani so an unpriced grid cell cannot be sold; once a
+        // real price is set, make it available. The owner can still retire one
+        // afterwards with weka_hali_ya_mchanganyiko.
+        `UPDATE mchanganyiko
+            SET bei = $2::numeric,
+                status = CASE WHEN $2::numeric > 0 THEN 'patikana' ELSE status END
+          WHERE id = ANY($1::int[])
+          RETURNING *`,
         [input.mchanganyiko, bei]
       );
       return rows;
@@ -2331,31 +2729,140 @@ const resolvers = {
       }
     },
 
+    // BR-26: register this till. The prefix is the half of the order number
+    // that stops two devices handing out the same one, so it is unique per shop
+    // and the database refuses a duplicate. Setup-time only, which is why it is
+    // owner-only: a device prefix appearing in a customer-visible number is not
+    // something the till should be able to change.
+    sajili_kifaa: async (_, { input }, ctx) => {
+      requireCan(ctx.user, 'product.manage');
+      const alama = (input.alama || '').trim().toUpperCase();
+      if (!alama || alama.length > 20) {
+        throw new GraphQLError('Alama ya kifaa inahitajika (hadi herufi 20).', {
+          extensions: { code: 'BAD_REQUEST' },
+        });
+      }
+      try {
+        const { rows } = await pool.query(
+          `INSERT INTO kifaa (alama, jina) VALUES ($1, $2) RETURNING *`,
+          [alama, (input.jina || '').trim() || alama]
+        );
+        return rows[0];
+      } catch (err) {
+        if (err.code === '23505') {
+          throw new GraphQLError('Alama ya kifaa tayari inatumika.', {
+            extensions: { code: 'CONFLICT' },
+          });
+        }
+        throw err;
+      }
+    },
+
+    ongeza_kipimo: async (_, { id, input }, ctx) => {
+      const u = ctx.user;
+      requireCan(u, 'order.create');
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const agizo = (
+          await client.query('SELECT * FROM agizo_maalum WHERE id = $1 FOR UPDATE', [id])
+        ).rows[0];
+        if (!agizo) {
+          throw new GraphQLError('Agizo halipo.', { extensions: { code: 'NOT_FOUND' } });
+        }
+        if (['collected', 'cancelled'].includes(agizo.hali)) {
+          throw new GraphQLError('Agizo uliokamilika hauwezi kubadilishwa.', {
+            extensions: { code: 'CONFLICT' },
+          });
+        }
+        const cols = await buildKipimoCols(client, input);
+        const row = await insertKipimoRow(client, id, cols);
+        const mtejaJina = agizo.mteja_id
+          ? (await client.query('SELECT jina FROM mteja WHERE id = $1', [agizo.mteja_id])).rows[0]
+              ?.jina
+          : null;
+        await syncOrderFromLines(client, id, { raisedBy: u.sub, mtejaJina });
+        await client.query('COMMIT');
+        return row;
+      } catch (err) {
+        await client.query('ROLLBACK');
+        throw err;
+      } finally {
+        client.release();
+      }
+    },
+
+    ondoa_kipimo: async (_, { kipimo_id }, ctx) => {
+      const u = ctx.user;
+      requireCan(u, 'order.create');
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const line = (
+          await client.query('SELECT * FROM agizo_kipimo WHERE id = $1 FOR UPDATE', [kipimo_id])
+        ).rows[0];
+        if (!line) {
+          await client.query('COMMIT');
+          return false;
+        }
+        const agizo = (
+          await client.query('SELECT * FROM agizo_maalum WHERE id = $1 FOR UPDATE', [line.agizo_id])
+        ).rows[0];
+        if (!agizo || ['collected', 'cancelled'].includes(agizo.hali)) {
+          throw new GraphQLError('Agizo uliokamilika hauwezi kubadilishwa.', {
+            extensions: { code: 'CONFLICT' },
+          });
+        }
+        const { rows: countRows } = await client.query(
+          'SELECT count(*)::int AS n FROM agizo_kipimo WHERE agizo_id = $1',
+          [line.agizo_id]
+        );
+        if (countRows[0].n <= 1) {
+          throw new GraphQLError('Agizo lazima libaki na angalau kipimo kimoja.', {
+            extensions: { code: 'CONFLICT' },
+          });
+        }
+        await client.query('DELETE FROM agizo_kipimo WHERE id = $1', [kipimo_id]);
+        const mtejaJina = agizo.mteja_id
+          ? (await client.query('SELECT jina FROM mteja WHERE id = $1', [agizo.mteja_id])).rows[0]
+              ?.jina
+          : null;
+        await syncOrderFromLines(client, line.agizo_id, { raisedBy: u.sub, mtejaJina });
+        await client.query('COMMIT');
+        return true;
+      } catch (err) {
+        await client.query('ROLLBACK');
+        throw err;
+      } finally {
+        client.release();
+      }
+    },
+
     unda_agizo: async (_, { input }, ctx) => {
       const u = ctx.user;
       requireCan(u, 'order.create');
-      // BR-05/D-28: the price of a custom cake comes from an owner quote. When
-      // the till does not send one, the order is not priced at all — it is
-      // created awaiting_quote and an owner is asked to price it. When a price
-      // IS sent, keep the old behaviour of pricing at the counter.
-      const hasPrice = input.bei_jumla !== undefined && input.bei_jumla !== null;
-      const bei_jumla = hasPrice ? Number(input.bei_jumla) : 0;
+      // Lines are the source of truth for price (BR-01/BR-02). bei_jumla on the
+      // input is only used for the legacy path (no kipimo[]): it becomes the
+      // price of a synthesised custom line. When kipimo[] is sent, client totals
+      // are ignored and the sum of frozen line prices wins.
+      const hasLegacyPrice = input.bei_jumla !== undefined && input.bei_jumla !== null;
+      const legacyBei = hasLegacyPrice ? Number(input.bei_jumla) : 0;
       const malipo_ya_awali = Number(input.malipo_ya_awali || 0);
-      if (hasPrice && (!Number.isFinite(bei_jumla) || bei_jumla <= 0)) {
+      if (hasLegacyPrice && (!Number.isFinite(legacyBei) || legacyBei <= 0)) {
         throw new GraphQLError('Bei jumla lazima iwe zaidi ya sifuri.', { extensions: { code: 'BAD_REQUEST' } });
       }
-      // A deposit above the total would make the generated salio column negative.
       if (!Number.isFinite(malipo_ya_awali) || malipo_ya_awali < 0) {
         throw new GraphQLError('Malipo ya awali haliwezi kuwa hasi.', { extensions: { code: 'BAD_REQUEST' } });
       }
-      if (hasPrice && malipo_ya_awali > bei_jumla) {
-        throw new GraphQLError('Malipo ya awali hayawezi kuzidi bei jumla.', { extensions: { code: 'BAD_REQUEST' } });
+      if (input.kipimo && input.kipimo.length === 0) {
+        throw new GraphQLError('Agizo lazima liwe na angalau kipimo kimoja.', {
+          extensions: { code: 'BAD_REQUEST' },
+        });
       }
-      // An unquoted order has no price yet, so there is nothing for a deposit to
-      // sit against. Taking money before the owner has priced the cake is exactly
-      // the thing BR-05 exists to prevent.
-      if (!hasPrice && malipo_ya_awali > 0) {
-        throw new GraphQLError('Agizo bado halijauni bei. Hakuna malipo ya awali.', {
+      const njia = input.njia_ya_kutimiza || 'pickup';
+      const anwani = (input.anwani_ya_kuleta || '').trim() || null;
+      if (njia === 'delivery' && !anwani) {
+        throw new GraphQLError('Anwani ya kuleta inahitajika kwa agizo la delivery.', {
           extensions: { code: 'BAD_REQUEST' },
         });
       }
@@ -2366,14 +2873,6 @@ const resolvers = {
         let mtejaJina = input.mteja_mpya?.jina;
         const simuMpya = (input.mteja_mpya?.simu || '').trim();
         if (!mtejaId && simuMpya) {
-          // The same person ordering twice must not become two customer records
-          // with split history. A phone number identifies a person well enough
-          // to reuse the existing record, even if the name was typed slightly
-          // differently ("Asha" vs "Asha M.").
-          //
-          // The name and allergy info from the new input are only applied when
-          // they add something. Overwriting a recorded allergy with a blank
-          // field would quietly erase safety information.
           const existing = (
             await client.query('SELECT id, jina, mzio FROM mteja WHERE simu = $1', [simuMpya])
           ).rows[0];
@@ -2403,118 +2902,190 @@ const resolvers = {
           ).rows[0];
           mtejaJina = m?.jina;
         }
-           // Which recipe this order is made from is decided here, not at the
-           // counter. The cashier described a cake; the kitchen's recipe book is
-           // an internal document and the person least able to choose correctly
-           // from it was the one being asked to.
-           //
-           // A client may still send mapishi_id, and only the owner may: that is
-           // the deliberate override for an order the matcher reads wrong. It is
-           // recorded as 'fuati' so an overridden match is never later mistaken
-           // for one the system worked out on its own.
-           let mapishiId = null;
-           let mapishiMethod = null;
-           let mapishiScore = null;
-           let mapishiReason = null;
 
-           if (input.mapishi_id) {
-             requireCan(u, 'recipe.override', 'Unaweza kubadilisha mapishi kwa agizo tu kama mmiliki.');
-             const rec = (
-               await client.query('SELECT id FROM mapishi WHERE id = $1 AND active', [input.mapishi_id])
-             ).rows[0];
-             if (!rec) {
-               throw new GraphQLError('Mapishi hakupatikani.', { extensions: { code: 'NOT_FOUND' } });
-             }
-             mapishiId = rec.id;
-             mapishiMethod = 'fuati';
-             mapishiReason = {
-               ulio: 'fuati',
-               maelezo: 'Mmiliki alichagua mapishi mwenyewe badala ya kile kilichopatikana kwa njia ya kawaida.',
-               maombi: { ladha: input.ladha, ukubwa: input.ukubwa, umbo: input.umbo },
-             };
-           } else {
-             // The matcher is handed the whole active book and returns one
-             // recipe. It never returns a list: a shortlist rendered anywhere in
-             // the UI is a recipe picker again, and the decision goes back to the
-             // cashier.
-             const kitabu = (
-               await client.query('SELECT id, ladha, ukubwa, active FROM mapishi WHERE active ORDER BY id')
-             ).rows;
-             const ulio = matchRecipe(
-               { ladha: input.ladha, ukubwa: input.ukubwa, umbo: input.umbo },
-               kitabu
-             );
-             mapishiId = ulio.mapishi_id;
-             mapishiMethod = ulio.method;
-             mapishiScore = ulio.score;
-             mapishiReason = ulio.reason;
-           }
-             const { rows } = await client.query(
-               `INSERT INTO agizo_maalum
-                (mteja_id, ladha, design, ukubwa, tarehe_ya_kuchukua, bei_jumla, malipo_ya_awali, hali, created_by, mapishi_id, umbo, maelekezo_maalum,
-                 mapishi_match_method, mapishi_match_score, mapishi_match)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $15::order_status, $8, $9, $10, $11, $12, $13, $14) RETURNING *`,
-               [
-                 mtejaId,
-                 input.ladha,
-                 input.design || null,
-                 input.ukubwa || null,
-                 input.tarehe_ya_kuchukua,
-                 bei_jumla,
-                 malipo_ya_awali,
-                 u.sub,
-                 mapishiId,
-                 (input.umbo || '').trim() || null,
-                 (input.maelekezo_maalum || '').trim() || null,
-                 mapishiMethod,
-                 mapishiScore,
-                 mapishiReason ? JSON.stringify(mapishiReason) : null,
-                 // An order with no price is not yet a real order to the kitchen
-                 // or the till, so it starts unquoted rather than 'ordered'.
-                 hasPrice ? 'ordered' : 'awaiting_quote',
-               ]
-             );
-           const agizo = rows[0];
+        let mapishiId = null;
+        let mapishiMethod = null;
+        let mapishiScore = null;
+        let mapishiReason = null;
 
-           // BR-05: an unpriced order asks the owner for a quote. The request is
-           // what carries the price back, so the order cannot be confirmed
-           // without the owner having answered. Skipped when the till priced it.
-           let ombiBei = null;
-           if (!hasPrice) {
-             ombiBei = await raiseQuoteRequest(client, agizo.id, u.sub, mtejaJina);
-           }
+        if (input.mapishi_id) {
+          requireCan(u, 'recipe.override', 'Unaweza kubadilisha mapishi kwa agizo tu kama mmiliki.');
+          const rec = (
+            await client.query('SELECT id FROM mapishi WHERE id = $1 AND active', [input.mapishi_id])
+          ).rows[0];
+          if (!rec) {
+            throw new GraphQLError('Mapishi hakupatikani.', { extensions: { code: 'NOT_FOUND' } });
+          }
+          mapishiId = rec.id;
+          mapishiMethod = 'fuati';
+          mapishiReason = {
+            ulio: 'fuati',
+            maelezo: 'Mmiliki alichagua mapishi mwenyewe badala ya kile kilichopatikana kwa njia ya kawaida.',
+            maombi: { ladha: input.ladha, ukubwa: input.ukubwa, umbo: input.umbo },
+          };
+        } else {
+          const kitabu = (
+            await client.query('SELECT id, ladha, ukubwa, active FROM mapishi WHERE active ORDER BY id')
+          ).rows;
+          const ulio = matchRecipe(
+            { ladha: input.ladha, ukubwa: input.ukubwa, umbo: input.umbo },
+            kitabu
+          );
+          mapishiId = ulio.mapishi_id;
+          mapishiMethod = ulio.method;
+          mapishiScore = ulio.score;
+          mapishiReason = ulio.reason;
+        }
 
-           const maelezo = `${agizo.ladha}${agizo.ukubwa ? ` — ${agizo.ukubwa}` : ''}`;
-           // An unquoted order gets no ticket: the kitchen queue is for work that
-           // is actually going ahead at a known price.
-           const tikiti = hasPrice
-             ? await tikitishaAgizo(client, {
-                 agizo_id: agizo.id,
-                 jumla: agizo.bei_jumla,
-                 maelezo,
-                 jina: mtejaJina,
-               })
-             : null;
-           // Whatever was handed over at the counter is real money in the till,
-           // so it is written into the sales ledger and linked back to the order.
-           // A NULL malipo_ya_awali means "nothing paid yet" and records nothing.
-           let malipo = null;
-           if (Number(agizo.malipo_ya_awali) > 0) {
-             const sale = await client.query(
-               `INSERT INTO mauzo (mfanyakazi_id, jumla, njia_ya_malipo, risiti_no, agizo_id)
-                VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-               [
-                 u.sub,
-                 agizo.malipo_ya_awali,
-                 input.njia_ya_malipo || 'cash',
-                 `AG-${Date.now()}-${Math.floor(Math.random() * 10000)}`,
-                 agizo.id,
-               ]
-             );
-             malipo = sale.rows[0];
-           }
-           await client.query('COMMIT');
-           return { ...agizo, tikiti, malipo, ombi_bei: ombiBei };
+        // Build every line before inserting the order, so bei_jumla / hali are
+        // correct on the first write and we never leave an empty order row.
+        let lineSpecs;
+        if (input.kipimo) {
+          lineSpecs = [];
+          for (const li of input.kipimo) {
+            lineSpecs.push(await buildKipimoCols(client, li));
+          }
+        } else {
+          // Legacy single-cake path: one custom line from the order header.
+          const synth = await buildKipimoCols(client, {
+            aina: 'custom',
+            kimo: input.ukubwa || null,
+            ladha_za_chakula: input.ladha,
+            maelezo:
+              [input.design, input.maelekezo_maalum].filter(Boolean).join(' — ') || input.ladha,
+            kiasi: 1,
+          });
+          if (hasLegacyPrice) synth.bei = legacyBei;
+          lineSpecs = [synth];
+        }
+
+        const bei_jumla = lineSpecs.reduce((s, c) => s + Number(c.bei) * c.kiasi, 0);
+        const needsQuote = lineSpecs.some((c) => Number(c.bei) <= 0);
+        if (needsQuote && malipo_ya_awali > 0) {
+          throw new GraphQLError('Agizo bado halijauni bei. Hakuna malipo ya awali.', {
+            extensions: { code: 'BAD_REQUEST' },
+          });
+        }
+        if (!needsQuote && malipo_ya_awali > bei_jumla) {
+          throw new GraphQLError('Malipo ya awali hayawezi kuzidi bei jumla.', {
+            extensions: { code: 'BAD_REQUEST' },
+          });
+        }
+
+        let nambari = null;
+        let kifaaId = null;
+        if (u.kifaa_id) {
+          kifaaId = u.kifaa_id;
+          // BR-26: prefix + calendar day + per-day sequence. The day is part of
+          // the number so a midnight reset cannot reuse TILL-1 from yesterday.
+          // Retry on unique collision: a counter can fall behind the numbers
+          // already issued today (clock skew, a test rewinding tarehe_namba, a
+          // restored backup). Advancing and trying again is safer than failing
+          // the sale, and the unique index is still the real backstop.
+          const siku = (
+            await client.query(`SELECT to_char(CURRENT_DATE, 'YYYYMMDD') AS d`)
+          ).rows[0].d;
+          for (let attempt = 0; attempt < 8; attempt++) {
+            nambari = `${u.kifaa_alama}-${siku}-${await kifaaChukuaNamba(client, u.kifaa_id)}`;
+            const clash = (
+              await client.query('SELECT 1 FROM agizo_maalum WHERE nambari = $1', [nambari])
+            ).rows[0];
+            if (!clash) break;
+            nambari = null;
+          }
+          if (!nambari) {
+            throw new GraphQLError('Imeshindikana kutoa nambari ya agizo. Jaribu tena.', {
+              extensions: { code: 'CONFLICT' },
+            });
+          }
+        }
+
+        const { rows } = await client.query(
+          `INSERT INTO agizo_maalum
+             (mteja_id, ladha, design, ukubwa, tarehe_ya_kuchukua, bei_jumla, malipo_ya_awali, hali, created_by, mapishi_id, umbo, maelekezo_maalum,
+              mapishi_match_method, mapishi_match_score, mapishi_match,
+              nambari, kifaa_id, chanzo, njia_ya_kutimiza, anwani_ya_kuleta)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $15::order_status, $8, $9, $10, $11, $12, $13, $14,
+                   $16, $17, $18::agizo_chanzo, $19::njia_ya_kutimiza, $20) RETURNING *`,
+          [
+            mtejaId,
+            input.ladha,
+            input.design || null,
+            input.ukubwa || null,
+            input.tarehe_ya_kuchukua,
+            bei_jumla,
+            malipo_ya_awali,
+            u.sub,
+            mapishiId,
+            (input.umbo || '').trim() || null,
+            (input.maelekezo_maalum || '').trim() || null,
+            mapishiMethod,
+            mapishiScore,
+            mapishiReason ? JSON.stringify(mapishiReason) : null,
+            needsQuote ? 'awaiting_quote' : 'ordered',
+            nambari,
+            kifaaId,
+            input.chanzo || 'walk_in',
+            njia,
+            anwani,
+          ]
+        );
+        const agizo = rows[0];
+
+        // Unregistered till: still give the order a stable human number so
+        // receipts and pickup calls are never blank. AG0 is the same prefix the
+        // migration uses for history — it is not a live till and never advances
+        // a counter, so using the row id keeps it unique without a sequence.
+        if (!agizo.nambari) {
+          const numbered = (
+            await client.query(
+              `UPDATE agizo_maalum
+                  SET nambari = 'AG0-' || id,
+                      kifaa_id = COALESCE(kifaa_id, (SELECT id FROM kifaa WHERE alama = 'AG0' LIMIT 1))
+                WHERE id = $1 AND nambari IS NULL
+                RETURNING *`,
+              [agizo.id]
+            )
+          ).rows[0];
+          if (numbered) Object.assign(agizo, numbered);
+        }
+
+        for (const cols of lineSpecs) {
+          await insertKipimoRow(client, agizo.id, cols);
+        }
+
+        let ombiBei = null;
+        if (needsQuote) {
+          ombiBei = await raiseQuoteRequest(client, agizo.id, u.sub, mtejaJina);
+        }
+
+        const maelezo = `${agizo.ladha}${agizo.ukubwa ? ` — ${agizo.ukubwa}` : ''}`;
+        const tikiti = !needsQuote
+          ? await tikitishaAgizo(client, {
+              agizo_id: agizo.id,
+              jumla: agizo.bei_jumla,
+              maelezo,
+              jina: mtejaJina,
+            })
+          : null;
+
+        let malipo = null;
+        if (Number(agizo.malipo_ya_awali) > 0) {
+          const sale = await client.query(
+            `INSERT INTO mauzo (mfanyakazi_id, jumla, njia_ya_malipo, risiti_no, agizo_id)
+             VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+            [
+              u.sub,
+              agizo.malipo_ya_awali,
+              input.njia_ya_malipo || 'cash',
+              `AG-${Date.now()}-${Math.floor(Math.random() * 10000)}`,
+              agizo.id,
+            ]
+          );
+          malipo = sale.rows[0];
+        }
+        await client.query('COMMIT');
+        return { ...agizo, tikiti, malipo, ombi_bei: ombiBei };
       } catch (err) {
         await client.query('ROLLBACK');
         throw err;
@@ -2524,31 +3095,27 @@ const resolvers = {
     },
 
     /**
-     * BR-05 / D-28: the owner prices an order that is awaiting_quote.
-     *
-     * This is the only path by which a custom cake that the till did not price
-     * gets a price. It sets the price, moves the order to 'ordered' so the
-     * kitchen and the till can act on it, issues the kitchen ticket, records any
-     * deposit as a real sale, and closes the quote request — all in one
-     * transaction, so an order can never be priced without the request being
-     * answered, or answered without the order being priced.
-     *
-     * Owner only. The whole point of the rule is that the person at the till
-     * cannot set this number.
+     * BR-05 / D-28: owner quotes an awaiting_quote order. Writes prices onto
+     * unpriced custom lines (not only bei_jumla), then derives the order total
+     * from SUM(bei * kiasi).
      */
-    toa_bei: async (_, { id, bei, malipo_ya_awali, njia_ya_malipo }, ctx) => {
+    toa_bei: async (_, { id, bei, malipo_ya_awali, njia_ya_malipo, kipimo }, ctx) => {
       const u = ctx.user;
       requireCan(u, 'order.quote');
       const beiJumla = Number(bei);
-      const malipo = Number(malipo_ya_awali || 0);
+      // Additional money taken at quote time. Null/omitted means "keep whatever
+      // was already paid" — critical once an order can have a catalogue deposit
+      // before a custom line is added and quoted (BR-01 + BR-05). Treating a
+      // missing value as 0 used to wipe the deposit and leave mauzo out of step.
+      const additional =
+        malipo_ya_awali === undefined || malipo_ya_awali === null
+          ? 0
+          : Number(malipo_ya_awali);
       if (!Number.isFinite(beiJumla) || beiJumla <= 0) {
         throw new GraphQLError('Bei lazima iwe zaidi ya sifuri.', { extensions: { code: 'BAD_REQUEST' } });
       }
-      if (!Number.isFinite(malipo) || malipo < 0) {
+      if (!Number.isFinite(additional) || additional < 0) {
         throw new GraphQLError('Malipo ya awali haliwezi kuwa hasi.', { extensions: { code: 'BAD_REQUEST' } });
-      }
-      if (malipo > beiJumla) {
-        throw new GraphQLError('Malipo ya awali hayawezi kuzidi bei jumla.', { extensions: { code: 'BAD_REQUEST' } });
       }
       const client = await pool.connect();
       try {
@@ -2561,20 +3128,112 @@ const resolvers = {
             extensions: { code: 'ALREADY_EXISTS' },
           });
         }
+
+        const unpriced = (
+          await client.query(
+            `SELECT * FROM agizo_kipimo WHERE agizo_id = $1 AND bei <= 0 ORDER BY id FOR UPDATE`,
+            [id]
+          )
+        ).rows;
+
+        if (kipimo && kipimo.length) {
+          for (const row of kipimo) {
+            const unit = Number(row.bei);
+            if (!Number.isFinite(unit) || unit <= 0) {
+              throw new GraphQLError('Bei ya kipimo lazima iwe zaidi ya sifuri.', {
+                extensions: { code: 'BAD_REQUEST' },
+              });
+            }
+            const updated = (
+              await client.query(
+                `UPDATE agizo_kipimo SET bei = $2
+                  WHERE id = $1 AND agizo_id = $3 AND bei <= 0
+                  RETURNING id`,
+                [row.kipimo_id, unit, id]
+              )
+            ).rows[0];
+            if (!updated) {
+              throw new GraphQLError('Kipimo hakipatikani au tayari kimebeiwa.', {
+                extensions: { code: 'NOT_FOUND', kipimo_id: row.kipimo_id },
+              });
+            }
+          }
+        } else if (unpriced.length === 1) {
+          // Owner quotes the order total; the remainder after already-priced
+          // catalogue lines becomes this custom line's contribution.
+          const priced = (
+            await client.query(
+              `SELECT COALESCE(SUM(bei * kiasi), 0)::float AS s
+                 FROM agizo_kipimo WHERE agizo_id = $1 AND bei > 0`,
+              [id]
+            )
+          ).rows[0].s;
+          const remainder = beiJumla - Number(priced);
+          if (!(remainder > 0)) {
+            throw new GraphQLError('Bei jumla haitoshi baada ya vipimo vilivyobeiwa.', {
+              extensions: { code: 'BAD_REQUEST' },
+            });
+          }
+          const unit = remainder / unpriced[0].kiasi;
+          await client.query('UPDATE agizo_kipimo SET bei = $2 WHERE id = $1', [
+            unpriced[0].id,
+            unit,
+          ]);
+        } else if (unpriced.length === 0) {
+          // No line table rows (should not happen after synth) — fall through
+          // and set order total only.
+        } else {
+          throw new GraphQLError(
+            'Agizo lina vipimo vingi bila bei. Tuma kipimo: [{kipimo_id, bei}] kwa kila kimoja.',
+            { extensions: { code: 'BAD_REQUEST', bado: unpriced.length } }
+          );
+        }
+
+        const still = (
+          await client.query(
+            `SELECT count(*)::int AS n FROM agizo_kipimo WHERE agizo_id = $1 AND bei <= 0`,
+            [id]
+          )
+        ).rows[0].n;
+        if (still > 0) {
+          throw new GraphQLError('Bado kuna vipimo bila bei.', {
+            extensions: { code: 'BAD_REQUEST', bado: still },
+          });
+        }
+
+        const { total } = await sumKipimoBei(client, id);
+        // Prefer the derived line total. If there were no lines, use beiJumla.
+        const finalTotal = total > 0 ? total : beiJumla;
+        if (Math.abs(finalTotal - beiJumla) > 0.009) {
+          throw new GraphQLError(
+            `Bei jumla (${beiJumla}) hailingani na jumla ya vipimo (${finalTotal}).`,
+            { extensions: { code: 'BAD_REQUEST' } }
+          );
+        }
+
+        const alreadyPaid = Number(order.malipo_ya_awali) || 0;
+        const newPaid = alreadyPaid + additional;
+        if (newPaid - finalTotal > 0.009) {
+          throw new GraphQLError('Malipo hayawezi kuzidi bei jumla.', {
+            extensions: { code: 'BAD_REQUEST' },
+          });
+        }
+
         const { rows } = await client.query(
           `UPDATE agizo_maalum
               SET bei_jumla = $2, malipo_ya_awali = $3, hali = 'ordered', updated_at = NOW()
             WHERE id = $1 RETURNING *`,
-          [id, beiJumla, malipo]
+          [id, finalTotal, newPaid]
         );
         const agizo = rows[0];
 
-        // Deposit is real money, so it goes into the sales ledger against the order.
-        if (malipo > 0) {
+        // Ledger only the increment. Re-writing alreadyPaid would invent a second
+        // cash event for money already taken (and already in mauzo).
+        if (additional > 0) {
           await client.query(
             `INSERT INTO mauzo (mfanyakazi_id, jumla, njia_ya_malipo, risiti_no, agizo_id)
              VALUES ($1, $2, $3, $4, $5)`,
-            [u.sub, malipo, njia_ya_malipo || 'cash', `AG-${Date.now()}-${Math.floor(Math.random() * 10000)}`, id]
+            [u.sub, additional, njia_ya_malipo || 'cash', `AG-${Date.now()}-${Math.floor(Math.random() * 10000)}`, id]
           );
         }
 
@@ -2589,8 +3248,6 @@ const resolvers = {
           jina: mtejaJina,
         });
 
-        // The quote request is answered. BR-05 makes its resolution the point at
-        // which the price is real, so it closes with the price, not after.
         await client.query(
           `UPDATE ombi
               SET hali = 'imekamilika',
@@ -2601,7 +3258,7 @@ const resolvers = {
             WHERE agizo_id = $1
               AND jukumu_anayehudumiwa = 'owner'
               AND hali NOT IN ('imekamilika', 'imekataa', 'imeghairi')`,
-          [id, `Bei: ${beiJumla}`, u.sub]
+          [id, `Bei: ${finalTotal}`, u.sub]
         );
         await client.query('COMMIT');
         return agizo;
@@ -2615,6 +3272,15 @@ const resolvers = {
 
     badge_hali_order: async (_, { id, hali }, ctx) => {
       const u = ctx.user;
+      // 'collected' must go through the same stock path as chukua_agizo (BR-03).
+      // A plain status write here used to mark the order done without decrementing
+      // catalogue stock — the seed and any caller that used badge for handover
+      // silently oversold the counter.
+      if (hali === 'collected') {
+        requireCan(u, 'order.collect');
+        return resolvers.Mutation.chukua_agizo(_, { id }, ctx);
+      }
+
       const current = (
         await pool.query('SELECT hali, created_by FROM agizo_maalum WHERE id = $1', [id])
       ).rows[0];
@@ -2628,16 +3294,31 @@ const resolvers = {
           extensions: { code: 'CONFLICT', hali: 'awaiting_quote' },
         });
       }
+      if (hali !== 'cancelled') {
+        const bado = (
+          await pool.query(
+            'SELECT count(*)::int AS n FROM agizo_kipimo WHERE agizo_id = $1 AND bei <= 0',
+            [id]
+          )
+        ).rows[0].n;
+        if (bado > 0) {
+          throw new GraphQLError('Agizo bado lina vipimo bila bei.', {
+            extensions: { code: 'CONFLICT', kipimo_bado: true },
+          });
+        }
+      }
 
       const allowedForChef = new Set(['in_progress', 'ready']);
-      const allowedForCashier = new Set(['collected']);
 
       if (u.jukumu === ROLE_OWNER) {
-        // owner can set any
+        // owner can set any non-collect status (collect diverted above)
       } else if (u.jukumu === ROLE_CHEF && allowedForChef.has(hali)) {
         requireCan(u, 'order.advance_status');
-      } else if (u.jukumu === ROLE_CASHIER && allowedForCashier.has(hali)) {
-        requireCan(u, 'order.collect');
+      } else if (u.jukumu === ROLE_CASHIER && hali === 'cancelled') {
+        // Cashiers cannot cancel — owner-only (BR-08). Fall through to forbid.
+        throw new GraphQLError('Hamna ruhusa ya kubadilisha hali ya agizo hili.', {
+          extensions: { code: 'FORBIDDEN' },
+        });
       } else {
         throw new GraphQLError('Hamna ruhusa ya kubadilisha hali ya agizo hili.', {
           extensions: { code: 'FORBIDDEN' },
@@ -2651,7 +3332,6 @@ const resolvers = {
         ordered: 'in_queue',
         in_progress: 'preparing',
         ready: 'ready',
-        collected: 'collected',
         cancelled: 'cancelled',
       }[hali];
       if (ticketHali) {
@@ -2726,21 +3406,50 @@ const resolvers = {
 
     chukua_agizo: async (_, { id }, ctx) => {
       requireCan(ctx.user, 'order.collect');
-      const cur = (await pool.query('SELECT hali FROM agizo_maalum WHERE id = $1', [id])).rows[0];
-      if (!cur) throw new GraphQLError('Agizo halipo.', { extensions: { code: 'NOT_FOUND' } });
-      if (cur.hali === 'cancelled') {
-        throw new GraphQLError('Agizo lililofutwa haliwezi kuchukuliwa.', { extensions: { code: 'BAD_REQUEST' } });
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const cur = (
+          await client.query('SELECT * FROM agizo_maalum WHERE id = $1 FOR UPDATE', [id])
+        ).rows[0];
+        if (!cur) throw new GraphQLError('Agizo halipo.', { extensions: { code: 'NOT_FOUND' } });
+        if (cur.hali === 'cancelled') {
+          throw new GraphQLError('Agizo lililofutwa haliwezi kuchukuliwa.', {
+            extensions: { code: 'BAD_REQUEST' },
+          });
+        }
+        if (cur.hali === 'awaiting_quote') {
+          throw new GraphQLError('Agizo bado halijauni bei na mmiliki.', {
+            extensions: { code: 'CONFLICT' },
+          });
+        }
+        const { bado, n } = await sumKipimoBei(client, id);
+        if (n < 1) {
+          throw new GraphQLError('Agizo halina vipimo.', { extensions: { code: 'CONFLICT' } });
+        }
+        if (bado > 0) {
+          throw new GraphQLError('Agizo bado lina vipimo bila bei.', {
+            extensions: { code: 'CONFLICT', kipimo_bado: true },
+          });
+        }
+        await decrementStockForOrder(client, id);
+        const { rows } = await client.query(
+          `UPDATE agizo_maalum SET hali = 'collected', updated_at = NOW() WHERE id = $1 RETURNING *`,
+          [id]
+        );
+        await client.query(
+          `UPDATE tikiti SET hali = 'collected', updated_at = NOW()
+            WHERE agizo_id = $1 AND hali NOT IN ('collected', 'cancelled')`,
+          [id]
+        );
+        await client.query('COMMIT');
+        return rows[0];
+      } catch (err) {
+        await client.query('ROLLBACK');
+        throw err;
+      } finally {
+        client.release();
       }
-      const { rows } = await pool.query(
-        `UPDATE agizo_maalum SET hali = 'collected', updated_at = NOW() WHERE id = $1 RETURNING *`,
-        [id]
-      );
-      if (!rows[0]) throw new GraphQLError('Agizo halipo.', { extensions: { code: 'NOT_FOUND' } });
-      await pool.query(
-        `UPDATE tikiti SET hali = 'collected', updated_at = NOW() WHERE agizo_id = $1 AND hali NOT IN ('collected', 'cancelled')`,
-        [id]
-      );
-      return rows[0];
     },
 
     futa_agizo: async (_, { id }, ctx) => {
@@ -3334,6 +4043,16 @@ const resolvers = {
         throw new GraphQLError('Tikiti lililofutwa haliwezi kuchukuliwa.', { extensions: { code: 'BAD_REQUEST' } });
       }
       if (cur.hali === 'collected') return cur;
+      // An order-backed ticket must take the same stock path as chukua_agizo
+      // (BR-03). Collecting the ticket alone used to mark the order done without
+      // decrementing catalogue lines.
+      if (cur.agizo_id) {
+        const agizo = await resolvers.Mutation.chukua_agizo(_, { id: cur.agizo_id }, ctx);
+        const ticket = (
+          await pool.query('SELECT * FROM tikiti WHERE id = $1', [id])
+        ).rows[0];
+        return ticket || { ...cur, hali: 'collected', agizo };
+      }
       const client = await pool.connect();
       try {
         await client.query('BEGIN');
@@ -3341,12 +4060,6 @@ const resolvers = {
           `UPDATE tikiti SET hali = 'collected', updated_at = NOW() WHERE id = $1 RETURNING *`,
           [id]
         );
-        if (cur.agizo_id) {
-          await client.query(
-            `UPDATE agizo_maalum SET hali = 'collected', updated_at = NOW() WHERE id = $1 AND hali NOT IN ('collected', 'cancelled')`,
-            [cur.agizo_id]
-          );
-        }
         await client.query('COMMIT');
         return rows[0];
       } catch (err) {
@@ -3391,6 +4104,10 @@ const resolvers = {
     },
 
     badge_hali_tikiti: async (_, { id, hali }, ctx) => {
+      // Same BR-03 rule as badge_hali_order: 'collected' must decrement stock.
+      if (hali === 'collected') {
+        return resolvers.Mutation.chukua_tikiti(_, { id }, ctx);
+      }
       requireCan(ctx.user, 'order.advance_status');
       const cur = (
         await pool.query('SELECT hali, agizo_id FROM tikiti WHERE id = $1', [id])
@@ -3407,11 +4124,13 @@ const resolvers = {
           [hali, id]
         );
         if (cur.agizo_id) {
-          const orderHali = { in_queue: 'ordered', preparing: 'in_progress', ready: 'ready', collected: 'collected', cancelled: 'cancelled' }[hali];
-          await client.query(
-            `UPDATE agizo_maalum SET hali = $1, updated_at = NOW() WHERE id = $2 AND hali != 'collected'`,
-            [orderHali, cur.agizo_id]
-          );
+          const orderHali = { in_queue: 'ordered', preparing: 'in_progress', ready: 'ready', cancelled: 'cancelled' }[hali];
+          if (orderHali) {
+            await client.query(
+              `UPDATE agizo_maalum SET hali = $1, updated_at = NOW() WHERE id = $2 AND hali != 'collected'`,
+              [orderHali, cur.agizo_id]
+            );
+          }
         }
         await client.query('COMMIT');
         return rows[0];

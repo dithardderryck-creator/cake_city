@@ -94,6 +94,8 @@ module.exports = gql`
   type AuthPayload {
     token: String!
     mtumiaji: Mtumiaji!
+    "BR-26: the till this session belongs to, or null if it was not registered. Shown in settings so an owner can see which device is issuing order numbers."
+    kifaa: Kifaa
   }
 
   type Bidhaa {
@@ -366,7 +368,81 @@ module.exports = gql`
         malipo: Mauzo
         "BR-05: the quote request raised for this order when the till did not price it. Present only while the order is awaiting_quote."
         ombi_bei: Ombi
+        "BR-26: the human-readable order number, unique across devices. Safe to read aloud at a counter. This is the number, not id."
+        nambari: String
+        "BR-01: the order's lines, catalogue and custom, in the order they were added. This is what the order is made of."
+        kipimo: [AgizoKipimo!]!
+        "True while any line still has bei <= 0 (unquoted custom). False means every line is priced and the kitchen can start."
+        kipimo_bado: Boolean!
+        "BR-01: whether this order mixes both kinds of line. Relevant because A-07 derives the order status from its lines in that case."
+        ina_katalogi_na_custom: Boolean!
+        chanzo: AgizoChanzo
+        njia_ya_kutimiza: NjiaYaKutimiza
+        "Required by the database whenever njia_ya_kutimiza is delivery, so a delivery order cannot exist without somewhere to go."
+        anwani_ya_kuleta: String
       }
+
+    enum AgizoChanzo { walk_in phone }
+    enum NjiaYaKutimiza { pickup delivery }
+
+    "BR-01: one line of an order. A catalogue line is sold from stock at a price the owner already set; a custom line is made to order and priced by quote. An order can hold any mix."
+    type AgizoKipimo {
+      id: ID!
+      agizo_id: ID!
+      aina: AinaYaKipimo!
+      "Live pointer to the combination this was sold from, for stock and reports. Nullable and ON DELETE SET NULL, because the snapshot below is the real record — an archived combination must not take an order's history with it."
+      mchanganyiko_id: ID
+      mchanganyiko: Mchanganyiko
+      "BR-11: the frozen record. What this line was at the moment it was entered — product name, chosen options, allergens, price. Deliberately not read from the catalogue, which has moved on since."
+      jina: String!
+      chaguo: [String!]!
+      viambisho: [String!]!
+      bei: Float!
+      kiasi: Int!
+      "D-42: the attributes that change what is baked. Blank on a catalogue line, where the combination already encodes them."
+      kimo: String
+      ladha_za_chakula: String
+      kijazi: String
+      tabaka: Int
+      mzabibu: String
+      "Free text. The kitchen reads this, so an inscription or decoration note lives here rather than in a structured field."
+      maelezo: String
+      created_at: DateTime
+    }
+
+    enum AinaYaKipimo { katalogi custom }
+
+    input KifaaInput {
+      "The device prefix, short and read aloud. Must be unique across the shop."
+      alama: String!
+      jina: String!
+    }
+
+    "BR-26: a till or panel. The prefix keeps order numbers unique across devices when two tills are in the same shop or a device was offline."
+    type Kifaa {
+      id: ID!
+      alama: String!
+      jina: String!
+      active: Boolean!
+      "Today's highest sequence number for this device, for showing an operator what the next one will be."
+      kiakili: Int!
+      tarehe_namba: Date
+    }
+
+    "One line to add to an order. Either kind, not both: a catalogue line names a combination, a custom line names recipe attributes."
+    input KipimoInput {
+      aina: AinaYaKipimo!
+      "Catalogue line. Its price comes from the combination, never from the client (BR-02)."
+      mchanganyiko_id: ID
+      kiasi: Int
+      "Custom line. The recipe attributes, D-42."
+      kimo: String
+      ladha_za_chakula: String
+      kijazi: String
+      tabaka: Int
+      mzabibu: String
+      maelezo: String
+    }
 
     # A payment taken against a special order. Recorded in the sales ledger and
     # linked to the order, so the day's takings include money collected at the
@@ -658,6 +734,12 @@ module.exports = gql`
     viambisho: [String!]
   }
 
+  "Correct a value already in the library. The owner gets names and allergens wrong sometimes, and with no way to correct them the only options are a wrong catalogue or a duplicate value. kundi_id is deliberately absent: moving a value between axes is a different operation, because the combinations that used it would need rebuilding."
+  input HaririThamaniInput {
+    jina: String!
+    viambisho: [String!]
+  }
+
   "Attach a group to a product, in the order the axes should appear on the sell screen."
   input WekaMakundiInput {
     bidhaa_id: ID!
@@ -723,12 +805,24 @@ module.exports = gql`
       umbo: String
       maelekezo_maalum: String
         tarehe_ya_kuchukua: Date!
-        "BR-05/D-28: omit this and the order is created awaiting_quote, and an owner is asked to price it. Supplying it keeps the old behaviour of pricing at the till."
+        "Legacy only when kipimo is omitted: becomes the price of a synthesised custom line. Ignored when kipimo[] is sent — the sum of line prices wins."
         bei_jumla: Float
         malipo_ya_awali: Float!
-      # How the deposit was paid. Optional so existing callers keep working; it
-      # defaults to cash, and the till screen always sends it explicitly.
       njia_ya_malipo: NjiaMalipo
+      "§4.4: walk_in or phone. Decided once at entry and reported on."
+      chanzo: AgizoChanzo
+      "§4.4: pickup or delivery."
+      njia_ya_kutimiza: NjiaYaKutimiza
+      "Required by the database when njia_ya_kutimiza is delivery. A delivery order with no address is refused rather than queued."
+      anwani_ya_kuleta: String
+      "BR-01: the order's lines. Required for the lines model; omit only for the legacy single-cake path (a custom line is synthesised from ladha/ukubwa)."
+      kipimo: [KipimoInput!]
+    }
+
+    input ToaBeiKipimoInput {
+      kipimo_id: ID!
+      "Unit price for this line. Required when the order has more than one unpriced custom line."
+      bei: Float!
     }
 
   input MatumiziInput {
@@ -798,7 +892,8 @@ module.exports = gql`
   }
 
   type Mutation {
-    login(id: ID!, pin: String!): AuthPayload!
+    "BR-26: sign in, identifying which till this is. Sent once by the panel at install. An omitted or unregistered till logs in normally but issues no order numbers."
+  login(id: ID!, pin: String!, kifaa: String): AuthPayload!
     bathi_bidhaa(input: BidhaaInput!): Bidhaa!
     ongeza_malighafi(input: MalighafiInput!): Malighafi!
     hariri_malighafi(id: ID!, input: MalighafiInput!): Malighafi!
@@ -810,6 +905,8 @@ module.exports = gql`
     ongeza_kundi(input: ChagizoKundiInput!): ChagizoKundi!
     hariri_kundi(id: ID!, input: ChagizoKundiInput!): ChagizoKundi!
     ongeza_thamani(input: ChagizoThamaniInput!): ChagizoThamani!
+  "Correct a value's name or allergens. This changes what the catalogue says from now on and deliberately does NOT touch combinations that already used it — those lines hold their own frozen copy (BR-11)."
+  hariri_thamani(id: ID!, input: HaririThamaniInput!): ChagizoThamani!
     futa_thamani(id: ID!): Boolean!
     weka_makundi_za_bidhaa(input: WekaMakundiInput!): Bidhaa!
     "§4.2: build the grid, then fill in prices. Re-running adds only the combinations that do not exist yet, so it never discards a price already set."
@@ -820,7 +917,13 @@ module.exports = gql`
     weka_hali_ya_mchanganyiko(id: ID!, status: HaliMchanganyiko!): Mchanganyiko!
     ongeza_mteja(input: MtejaInput!): Mteja!
     unda_mauzo(bidhaa: [MauzoBidhaaInput!]!, njia_ya_malipo: NjiaMalipo!, punguzo: Float): Mauzo!
-    unda_agizo(input: AgizoInput!): AgizoMaalum!
+      unda_agizo(input: AgizoInput!): AgizoMaalum!
+      "BR-01: add a line to an order. A catalogue line takes its price from the combination, never from the client (BR-02), and the combination's name, options and allergens are frozen onto the line (BR-11)."
+      ongeza_kipimo(id: ID!, input: KipimoInput!): AgizoKipimo!
+      "Remove a line. Refused once the order is collected or cancelled — history is not editable at that point."
+      ondoa_kipimo(kipimo_id: ID!): Boolean!
+      "BR-26: register this till so it can issue order numbers. Called once at install; the prefix is what stops two devices handing out the same number."
+      sajili_kifaa(input: KifaaInput!): Kifaa!
     lipa_salio(id: ID!, kiasi: Float!, njia_ya_malipo: NjiaMalipo): MalipoJumla!
     badge_hali_order(id: ID!, hali: HaliOrder!): AgizoMaalum!
     chukua_agizo(id: ID!): AgizoMaalum!
@@ -831,8 +934,8 @@ module.exports = gql`
     "Inventory confirms the real number. This is the point stock actually moves."
     thibitisha_matumizi(id: ID!, kiasi_halisi: Float!): KumbukumbuMatumizi!    "BR-13: confirm a whole usage sheet and close its auto-raised request in one atomic step. Each line may carry an exact kiasi_halisi; a line omitted from kuchagua is confirmed at the chef's own tapped midpoint. This is the point stock actually moves."
     thibitisha_matumizi_kundi(zingumiaji_id: ID!, kuchagua: [KuchaguaMatumiziInput!]): ZingumiajiMatumizi!
-    "BR-05/D-28: the owner prices an order that is awaiting_quote. This is the only way a custom cake gets its price, and it moves the order to 'ordered' so the kitchen and till can act on it."
-    toa_bei(id: ID!, bei: Float!, malipo_ya_awali: Float, njia_ya_malipo: NjiaMalipo): AgizoMaalum!
+    "BR-05/D-28: the owner prices an order that is awaiting_quote. Writes the quote onto unpriced custom lines and sets bei_jumla from SUM(bei*kiasi). malipo_ya_awali is ADDITIONAL money taken at quote time — existing deposits are kept. When more than one line needs a price, pass kipimo: [{kipimo_id, bei}]."
+    toa_bei(id: ID!, bei: Float!, malipo_ya_awali: Float, njia_ya_malipo: NjiaMalipo, kipimo: [ToaBeiKipimoInput!]): AgizoMaalum!
 
     unda_mapishi(input: MapishiInput!): Mapishi!
     hariri_mapishi(id: ID!, input: MapishiInput!): Mapishi!

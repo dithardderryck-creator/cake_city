@@ -359,6 +359,15 @@ const insertUsageBatch = async (
          );
          out.push(rows[0]);
        }
+
+       // BR-13: a submitted report raises a request to Inventory, and resolving
+       // that request is the confirmation. Without it the sheet only ever sits
+       // in a queue nobody was asked to act on, and the confirmation has no
+       // request thread on the audit trail.
+       if (sheet) {
+         await raiseUsageConfirmation(client, sheet.id, u.sub, agizo_id, merged.length);
+       }
+
        await client.query('COMMIT');
        return out;
      } catch (err) {
@@ -368,6 +377,64 @@ const insertUsageBatch = async (
        client.release();
      }
    };
+
+/**
+ * BR-13: raise the confirmation request that a submitted usage report creates.
+ *
+ * Runs inside the submitter's transaction, so the request and the sheet it
+ * describes are committed together or not at all. A report with no matching
+ * request would put a queue entry nobody was asked to act on.
+ *
+ * The recipient is the Inventory role, resolved to an active staff member. The
+ * blueprint routes to a role rather than a person, and the schema already keeps
+ * jukumu_anayehudumiwa so the record still reads correctly if that person later
+ * leaves. Where more than one person holds the role, the oldest active one is
+ * used deterministically; the request is a role's to answer, not one person's.
+ *
+ * Starts at inasubiri, not imeandikwa. A human request has a draft window
+ * because a person writes it; this one is already delivered, so inventing a
+ * draft state for it would only add a step nobody can act on.
+ */
+const raiseUsageConfirmation = async (client, sheetId, raisedBy, agizoId, lineCount) => {
+  const to = (
+    await client.query(
+      `SELECT id FROM mtumiaji
+        WHERE jukumu = 'inventory' AND active
+        ORDER BY id
+        LIMIT 1`
+    )
+  ).rows[0];
+  if (!to) {
+    // No one holds the Inventory role, so there is nobody to route to. The
+    // sheet still exists and can still be confirmed line by line; this is a
+    // staffing gap, not a reason to fail the chef's submission.
+    return null;
+  }
+  if (Number(to.id) === Number(raisedBy)) {
+    // ombi has CHECK (kutoka_kwa <> kwenda_kwa): a person cannot be the
+    // recipient of their own request. If the only Inventory member is the one
+    // reporting, there is no separate recipient and the request is skipped
+    // rather than fabricated.
+    return null;
+  }
+  const n = Number(lineCount) || 0;
+  const { rows } = await client.query(
+    `INSERT INTO ombi
+       (kutoka_kwa, kwenda_kwa, ujumbe, mada, aina, kipendeleo,
+        agizo_id, zingumiaji_id, jukumu_anayehudumiwa, hali)
+     VALUES ($1, $2, $3, $4, 'ombi', 'kawaida', $5, $6, 'inventory', 'inasubiri')
+     RETURNING *`,
+    [
+      raisedBy,
+      to.id,
+      `Msaidie akadiria matumizi ya malighafi: mistari ${n} imeandikwa. Thibitisha kiasi halisi ili hisa iongeze.`,
+      `Thibitisha matumizi (mistari ${n})`,
+      agizoId || null,
+      sheetId,
+    ]
+  );
+  return rows[0];
+};
 
 /**
  * Validate + normalise a recipe's ingredient lines. Shared by create and
@@ -854,6 +921,16 @@ const resolvers = {
     agizo: async (o) => {
       if (!o.agizo_id) return null;
       const { rows } = await pool.query('SELECT * FROM agizo_maalum WHERE id = $1', [o.agizo_id]);
+      return rows[0] || null;
+    },
+    // BR-13: the confirmation request points at the sheet it was raised for, so
+    // the queue can show what is actually waiting and a resolve can find it.
+    zingumiaji: async (o) => {
+      if (!o.zingumiaji_id) return null;
+      const { rows } = await pool.query(
+        'SELECT * FROM zingumiaji_matumizi WHERE id = $1',
+        [o.zingumiaji_id]
+      );
       return rows[0] || null;
     },
     alizokamilisha_na: async (o) => {
@@ -2100,6 +2177,151 @@ const resolvers = {
             WHERE id = $1
             RETURNING *`,
           [id, halisi, ctx.user.sub]
+        );
+        await client.query('COMMIT');
+        return rows[0];
+      } catch (err) {
+        await client.query('ROLLBACK');
+        throw err;
+      } finally {
+        client.release();
+      }
+    },
+
+    /**
+     * BR-13: confirm a whole usage sheet and close the request that was raised
+     * for it, in one transaction.
+     *
+     * Confirming the sheet is what moves stock — the existing DB trigger
+     * trigger_usage_decrement_on_verify does the subtraction when each line
+     * flips to imethibitishwa, so this resolver must not also subtract by hand
+     * or stock would be reduced twice. That is the same contract the
+     * single-line thibitisha_matumizi already keeps.
+     *
+     * Every line is confirmed in the same transaction, so stock can never be
+     * left half-moved by a failure partway through a sheet. The row lock stops
+     * two people confirming the same sheet at once.
+     *
+     * A line omitted from kuchagua is confirmed at the chef's own tapped
+     * midpoint: the report already carries a defensible number for it, and
+     * inventory overriding every line by hand is not what BR-13 asks for.
+     */
+    thibitisha_matumizi_kundi: async (_, { zingumiaji_id, kuchagua }, ctx) => {
+      requireCan(ctx.user, 'usage.verify');
+      const overrides = new Map();
+      for (const k of kuchagua || []) {
+        const lid = Number(k.id);
+        if (!Number.isInteger(lid) || lid <= 0) {
+          throw new GraphQLError('Mistari ya kuthibitisha haipatikani.', {
+            extensions: { code: 'BAD_REQUEST' },
+          });
+        }
+        if (k.kiasi_halisi === undefined || k.kiasi_halisi === null) {
+          throw new GraphQLError('Kiasi halisi lazima kiwe namba isiyo chini ya sifuri.', {
+            extensions: { code: 'BAD_REQUEST' },
+          });
+        }
+        const q = Number(k.kiasi_halisi);
+        if (!Number.isFinite(q) || q < 0) {
+          throw new GraphQLError('Kiasi halisi lazima kiwe namba isiyo chini ya sifuri.', {
+            extensions: { code: 'BAD_REQUEST' },
+          });
+        }
+        if (overrides.has(lid)) {
+          throw new GraphQLError('Mstari huo umeorodheshwa mara mbili.', {
+            extensions: { code: 'BAD_REQUEST' },
+          });
+        }
+        overrides.set(lid, q);
+      }
+
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        await client.query("SELECT set_config('app.fanya_kwa', $1, true)", [String(ctx.user.sub)]);
+
+        const sheet = (
+          await client.query(
+            'SELECT * FROM zingumiaji_matumizi WHERE id = $1 FOR UPDATE',
+            [zingumiaji_id]
+          )
+        ).rows[0];
+        if (!sheet) {
+          throw new GraphQLError('Kundi la matumizi halipo.', { extensions: { code: 'NOT_FOUND' } });
+        }
+        if (sheet.hali === 'imethibitishwa') {
+          throw new GraphQLError('Kundi hili limehakikiwa tayari.', {
+            extensions: { code: 'ALREADY_VERIFIED' },
+          });
+        }
+        if (sheet.hali === 'imebadilishwa') {
+          // An amendment supersedes the sheet, so the replacement is the thing
+          // now waiting on inventory. Confirming the dead one would move stock
+          // from taps the chef has already withdrawn.
+          throw new GraphQLError('Kundi hili limebadilishwa. Hakiki kundi mpya.', {
+            extensions: { code: 'ALREADY_VERIFIED' },
+          });
+        }
+
+        const lines = (
+          await client.query(
+            `SELECT id, kiasi FROM kumbukumbu_matumizi
+              WHERE zingumiaji_id = $1 AND hali = 'inakadiriwa'
+              FOR UPDATE`,
+            [zingumiaji_id]
+          )
+        ).rows;
+
+        if (overrides.size) {
+          const strays = [...overrides.keys()].filter(
+            (id) => !lines.some((l) => l.id === id)
+          );
+          if (strays.length) {
+            throw new GraphQLError('Baadhi ya mistari ya kuthibitisha ni ya kundi lingine.', {
+              extensions: { code: 'BAD_REQUEST', mistari_ids: strays },
+            });
+          }
+        }
+
+        // kiasi = 0 means "not actually used". It still marks the line verified,
+        // so the trigger subtracts zero and the line stops sitting in the queue.
+        for (const l of lines) {
+          const halisi = overrides.has(l.id) ? overrides.get(l.id) : Number(l.kiasi);
+          await client.query(
+            `UPDATE kumbukumbu_matumizi
+                SET hali = 'imethibitishwa', kiasi_halisi = $2,
+                    imethibitishwa_na = $3, tarehe_ya_uthibitisho = now()
+              WHERE id = $1`,
+            [l.id, halisi, ctx.user.sub]
+          );
+        }
+
+        await client.query(
+          `UPDATE zingumiaji_matumizi
+              SET hali = 'imethibitishwa', imethibitishwa_na = $2, tarehe_ya_uthibitisho = now()
+            WHERE id = $1`,
+          [zingumiaji_id, ctx.user.sub]
+        );
+
+        // Resolving the request is the confirmation (BR-13), so the request is
+        // closed in the same transaction as the stock movement. If this failed,
+        // stock would have moved with an open request still claiming to be
+        // waiting — the exact state the rule exists to prevent.
+        await client.query(
+          `UPDATE ombi
+              SET hali = 'imekamilika',
+                  jibu = COALESCE(jibu, 'Matumizi yamethibitishwa.'),
+                  alizokamilisha_na = $2,
+                  alizokamilisha_at = now(),
+                  tarehe_ya_kufunguliwa = now()
+            WHERE zingumiaji_id = $1
+              AND hali NOT IN ('imekamilika', 'imekataa', 'imeghairi')`,
+          [zingumiaji_id, ctx.user.sub]
+        );
+
+        const { rows } = await client.query(
+          'SELECT * FROM zingumiaji_matumizi WHERE id = $1',
+          [zingumiaji_id]
         );
         await client.query('COMMIT');
         return rows[0];

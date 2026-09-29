@@ -228,6 +228,8 @@ module.exports = gql`
     kiasi: Float
     "The order this came out of, when it came out of one."
     agizo: AgizoMaalum
+    "The usage sheet this request was auto-raised for by BR-13. Non-null only on the confirmation request created when a usage report is submitted. Resolving that request is the confirmation."
+    zingumiaji: ZingumiajiMatumizi
     "When this needs to be done by. Null means the owner did not set one."
     mwisho: Date
     "The recipient's role when this was sent, so the record still reads correctly after a role change or a staff deletion."
@@ -653,6 +655,12 @@ module.exports = gql`
     sehemu: String
   }
 
+  "One line of an inventory whole-sheet confirmation (BR-13). Inventory only overrides the lines that need it; omitted lines confirm at the chef's tapped midpoint."
+  input KuchaguaMatumiziInput {
+    id: ID!
+    kiasi_halisi: Float
+  }
+
   input MapishiInput {
     ladha: String!
     ukubwa: String!
@@ -696,6 +704,8 @@ module.exports = gql`
     log_matumizi_kundi(input: MatumiziKundiInput!): [KumbukumbuMatumizi!]!
     "Inventory confirms the real number. This is the point stock actually moves."
     thibitisha_matumizi(id: ID!, kiasi_halisi: Float!): KumbukumbuMatumizi!
+    "BR-13: confirm a whole usage sheet and close its auto-raised request in one atomic step. Each line may carry an exact kiasi_halisi; a line omitted from kuchagua is confirmed at the chef's own tapped midpoint. This is the point stock actually moves."
+    thibitisha_matumizi_kundi(zingumiaji_id: ID!, kuchagua: [KuchaguaMatumiziInput!]): ZingumiajiMatumizi!
 
     unda_mapishi(input: MapishiInput!): Mapishi!
     hariri_mapishi(id: ID!, input: MapishiInput!): Mapishi!

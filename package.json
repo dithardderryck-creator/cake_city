@@ -20,7 +20,8 @@
     "db:reset": "dropdb --if-exists cakecity && createdb cakecity && node src/db/init.js",
     "db:migrate": "node -e \"require('dotenv').config({quiet:true});const{runMigrations}=require('./src/db/migrate');const p=require('./src/db/pool');runMigrations().then(a=>{console.log(a.length?'Applied: '+a.join(', '):'Already up to date');return p.end()}).then(()=>process.exit(0))\"",
     "verify:chef": "node scripts/verify-chef-and-requests.js",
-    "verify:matcher": "node scripts/verify-matcher.js"
+    "verify:matcher": "node scripts/verify-matcher.js",
+    "verify:br13": "node scripts/verify-usage-request.js"
   },
   "dependencies": {
     "@apollo/server": "^4.11.3",

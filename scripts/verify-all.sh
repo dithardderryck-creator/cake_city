@@ -80,7 +80,7 @@ status=0
     fi
   done
 
-  for suite in verify verify:recipes verify:br13; do
+  for suite in verify verify:recipes verify:br13 verify:br05; do
     echo ""
     echo "=== $suite ==="
     start_api || exit 1

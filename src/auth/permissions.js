@@ -18,8 +18,11 @@ const PERMISSIONS = {
     'order.advance_status': true,
     'order.collect': true,
     'order.cancel': true,
-    'usage.create': true,
-    'usage.read_all': true,
+    // BR-05/D-28: quoting a custom cake. Owner only, and separate from
+    // order.create on purpose: the person who describes the cake at the till is
+    // not the person who decides what it costs.
+    'order.quote': true,
+    'usage.create': true,    'usage.read_all': true,
     // Confirming the real number is what moves stock, so it is kept separate
     // from usage.create (the chef's estimate) and from usage.read_all (viewing).
     'usage.verify': true,

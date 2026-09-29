@@ -47,10 +47,17 @@ a shop would.
 
 ## 3. Genuine contradictions — only two survive
 
-**BR-05 / D-28 pricing authority.** The blueprint makes the owner the only party
-who can price a custom cake, delivered as a request, and the line is not confirmed
-until the quote resolves. The build makes `bei_jumla` a required field at creation,
-set by whoever creates the order. This inverts authority, not just naming.
+**BR-05 / D-28 pricing authority.** Now **closed**. The price of a custom cake
+comes from an owner quote, delivered as a request, and the order is not confirmed
+until the quote resolves. A new `awaiting_quote` order state lets the till describe
+a cake with no price; the order is created unquoted, a quote request is raised to
+the owner, no ticket is issued and no money is taken; the owner prices it via
+`toa_bei` (owner-only `order.quote`), which sets the price, moves the order to
+`ordered`, issues the kitchen ticket, records any deposit, and closes the quote
+request in one transaction. An unquoted order cannot enter production, and a
+priced order cannot be re-quoted. Pricing at the till is still allowed when a
+price is supplied — this is a permission change, not a removal. Covered by
+`npm run verify:br05` (15 checks).
 
 **BR-13 usage report auto-creates a request to Inventory.** Now **closed**. A
 submitted report raises a request routed to the Inventory role and linked to the

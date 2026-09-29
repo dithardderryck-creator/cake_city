@@ -440,6 +440,49 @@ const raiseUsageConfirmation = async (client, sheetId, raisedBy, agizoId, lineCo
  * Validate + normalise a recipe's ingredient lines. Shared by create and
  * edit so both reject the same mistakes the same way.
  */
+/**
+ * BR-05 / D-28: ask the owner to price an order the till could not price.
+ *
+ * The blueprint puts the price of a custom cake with the owner, delivered as a
+ * request, and the order is not confirmed until that request is resolved. This
+ * raises that request. It is the same ombi table the usage chain uses; the
+ * difference is who it goes to and what the kitchen is waiting for.
+ *
+ * Routed to the owner, resolved to an active owner account. D-28 says the owner
+ * quotes and the cashier enters, so this goes to the owner and the reply is the
+ * number; the till then records it. Where more than one owner account exists the
+ * oldest is used, matching the usage request's deterministic choice.
+ *
+ * If the person raising it is the only owner, the CHECK (kutoka_kwa <>
+ * kwenda_kwa) would reject a self-addressed request. That case is a shop run by
+ * one person; the order is still created awaiting_quote and the owner can price
+ * it directly with toa_bei, so the request is simply skipped rather than
+ * failing the order.
+ */
+const raiseQuoteRequest = async (client, agizoId, raisedBy, mtejaJina) => {
+  const to = (
+    await client.query(
+      `SELECT id FROM mtumiaji WHERE jukumu = 'owner' AND active ORDER BY id LIMIT 1`
+    )
+  ).rows[0];
+  if (!to || Number(to.id) === Number(raisedBy)) return null;
+  const { rows } = await client.query(
+    `INSERT INTO ombi
+       (kutoka_kwa, kwenda_kwa, ujumbe, mada, aina, kipendeleo,
+        agizo_id, jukumu_anayehudumiwa, hali)
+     VALUES ($1, $2, $3, $4, 'ombi', 'haraka', $5, 'owner', 'inasubiri')
+     RETURNING *`,
+    [
+      raisedBy,
+      to.id,
+      `Agizo ${agizoId} linaombwa bei na mmiliki kabla ya kuanza.`,
+      `Nomba bei ya agizo #${agizoId}${mtejaJina ? ` (${mtejaJina})` : ''}`,
+      agizoId,
+    ]
+  );
+  return rows[0];
+};
+
 const normaliseIngredients = async (client, viambato, allowEmpty = false) => {
   if (!Array.isArray(viambato) || !viambato.length) {
     // A fraction_of recipe is meant to have no lines of its own — it inherits
@@ -724,6 +767,19 @@ const resolvers = {
       can(ctx.user, 'order.read_all') ? order.salio : null,
     created_by: (order, _, ctx) =>
       can(ctx.user, 'order.read_all') ? order.created_by : null,
+    // BR-05: the quote request is pricing workflow, so it is visible to the
+    // people who can act on a price (owner, cashier) and not to the kitchen.
+    ombi_bei: async (order, _, ctx) => {
+      if (!can(ctx.user, 'order.read_all')) return null;
+      const { rows } = await pool.query(
+        `SELECT * FROM ombi
+          WHERE agizo_id = $1 AND ujumbe ILIKE '%agizo%'
+            AND jukumu_anayehudumiwa = 'owner'
+          ORDER BY id DESC LIMIT 1`,
+        [order.id]
+      );
+      return rows[0] || null;
+    },
     muda_hitajika: async (order) => {
       // A recipe-book order already carries a weighed prep time on the recipe
       // itself, which is the kitchen-tested number. The free-text lookup below
@@ -1823,17 +1879,30 @@ const resolvers = {
     unda_agizo: async (_, { input }, ctx) => {
       const u = ctx.user;
       requireCan(u, 'order.create');
-      const bei_jumla = Number(input.bei_jumla);
+      // BR-05/D-28: the price of a custom cake comes from an owner quote. When
+      // the till does not send one, the order is not priced at all — it is
+      // created awaiting_quote and an owner is asked to price it. When a price
+      // IS sent, keep the old behaviour of pricing at the counter.
+      const hasPrice = input.bei_jumla !== undefined && input.bei_jumla !== null;
+      const bei_jumla = hasPrice ? Number(input.bei_jumla) : 0;
       const malipo_ya_awali = Number(input.malipo_ya_awali || 0);
-      if (!Number.isFinite(bei_jumla) || bei_jumla <= 0) {
+      if (hasPrice && (!Number.isFinite(bei_jumla) || bei_jumla <= 0)) {
         throw new GraphQLError('Bei jumla lazima iwe zaidi ya sifuri.', { extensions: { code: 'BAD_REQUEST' } });
       }
       // A deposit above the total would make the generated salio column negative.
       if (!Number.isFinite(malipo_ya_awali) || malipo_ya_awali < 0) {
         throw new GraphQLError('Malipo ya awali haliwezi kuwa hasi.', { extensions: { code: 'BAD_REQUEST' } });
       }
-      if (malipo_ya_awali > bei_jumla) {
+      if (hasPrice && malipo_ya_awali > bei_jumla) {
         throw new GraphQLError('Malipo ya awali hayawezi kuzidi bei jumla.', { extensions: { code: 'BAD_REQUEST' } });
+      }
+      // An unquoted order has no price yet, so there is nothing for a deposit to
+      // sit against. Taking money before the owner has priced the cake is exactly
+      // the thing BR-05 exists to prevent.
+      if (!hasPrice && malipo_ya_awali > 0) {
+        throw new GraphQLError('Agizo bado halijauni bei. Hakuna malipo ya awali.', {
+          extensions: { code: 'BAD_REQUEST' },
+        });
       }
       const client = await pool.connect();
       try {
@@ -1929,14 +1998,14 @@ const resolvers = {
                `INSERT INTO agizo_maalum
                 (mteja_id, ladha, design, ukubwa, tarehe_ya_kuchukua, bei_jumla, malipo_ya_awali, hali, created_by, mapishi_id, umbo, maelekezo_maalum,
                  mapishi_match_method, mapishi_match_score, mapishi_match)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, 'ordered', $8, $9, $10, $11, $12, $13, $14) RETURNING *`,
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $15::order_status, $8, $9, $10, $11, $12, $13, $14) RETURNING *`,
                [
                  mtejaId,
                  input.ladha,
                  input.design || null,
                  input.ukubwa || null,
                  input.tarehe_ya_kuchukua,
-                 input.bei_jumla,
+                 bei_jumla,
                  malipo_ya_awali,
                  u.sub,
                  mapishiId,
@@ -1945,16 +2014,32 @@ const resolvers = {
                  mapishiMethod,
                  mapishiScore,
                  mapishiReason ? JSON.stringify(mapishiReason) : null,
+                 // An order with no price is not yet a real order to the kitchen
+                 // or the till, so it starts unquoted rather than 'ordered'.
+                 hasPrice ? 'ordered' : 'awaiting_quote',
                ]
              );
            const agizo = rows[0];
+
+           // BR-05: an unpriced order asks the owner for a quote. The request is
+           // what carries the price back, so the order cannot be confirmed
+           // without the owner having answered. Skipped when the till priced it.
+           let ombiBei = null;
+           if (!hasPrice) {
+             ombiBei = await raiseQuoteRequest(client, agizo.id, u.sub, mtejaJina);
+           }
+
            const maelezo = `${agizo.ladha}${agizo.ukubwa ? ` — ${agizo.ukubwa}` : ''}`;
-           const tikiti = await tikitishaAgizo(client, {
-             agizo_id: agizo.id,
-             jumla: agizo.bei_jumla,
-             maelezo,
-             jina: mtejaJina,
-           });
+           // An unquoted order gets no ticket: the kitchen queue is for work that
+           // is actually going ahead at a known price.
+           const tikiti = hasPrice
+             ? await tikitishaAgizo(client, {
+                 agizo_id: agizo.id,
+                 jumla: agizo.bei_jumla,
+                 maelezo,
+                 jina: mtejaJina,
+               })
+             : null;
            // Whatever was handed over at the counter is real money in the till,
            // so it is written into the sales ledger and linked back to the order.
            // A NULL malipo_ya_awali means "nothing paid yet" and records nothing.
@@ -1974,7 +2059,97 @@ const resolvers = {
              malipo = sale.rows[0];
            }
            await client.query('COMMIT');
-           return { ...agizo, tikiti, malipo };
+           return { ...agizo, tikiti, malipo, ombi_bei: ombiBei };
+      } catch (err) {
+        await client.query('ROLLBACK');
+        throw err;
+      } finally {
+        client.release();
+      }
+    },
+
+    /**
+     * BR-05 / D-28: the owner prices an order that is awaiting_quote.
+     *
+     * This is the only path by which a custom cake that the till did not price
+     * gets a price. It sets the price, moves the order to 'ordered' so the
+     * kitchen and the till can act on it, issues the kitchen ticket, records any
+     * deposit as a real sale, and closes the quote request — all in one
+     * transaction, so an order can never be priced without the request being
+     * answered, or answered without the order being priced.
+     *
+     * Owner only. The whole point of the rule is that the person at the till
+     * cannot set this number.
+     */
+    toa_bei: async (_, { id, bei, malipo_ya_awali, njia_ya_malipo }, ctx) => {
+      const u = ctx.user;
+      requireCan(u, 'order.quote');
+      const beiJumla = Number(bei);
+      const malipo = Number(malipo_ya_awali || 0);
+      if (!Number.isFinite(beiJumla) || beiJumla <= 0) {
+        throw new GraphQLError('Bei lazima iwe zaidi ya sifuri.', { extensions: { code: 'BAD_REQUEST' } });
+      }
+      if (!Number.isFinite(malipo) || malipo < 0) {
+        throw new GraphQLError('Malipo ya awali haliwezi kuwa hasi.', { extensions: { code: 'BAD_REQUEST' } });
+      }
+      if (malipo > beiJumla) {
+        throw new GraphQLError('Malipo ya awali hayawezi kuzidi bei jumla.', { extensions: { code: 'BAD_REQUEST' } });
+      }
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        await client.query("SELECT set_config('app.fanya_kwa', $1, true)", [String(u.sub)]);
+        const order = (await client.query('SELECT * FROM agizo_maalum WHERE id = $1 FOR UPDATE', [id])).rows[0];
+        if (!order) throw new GraphQLError('Agizo halipo.', { extensions: { code: 'NOT_FOUND' } });
+        if (order.hali !== 'awaiting_quote') {
+          throw new GraphQLError('Agizo hili tayari limebeiwa au haliwezi kubadilishwa.', {
+            extensions: { code: 'ALREADY_EXISTS' },
+          });
+        }
+        const { rows } = await client.query(
+          `UPDATE agizo_maalum
+              SET bei_jumla = $2, malipo_ya_awali = $3, hali = 'ordered', updated_at = NOW()
+            WHERE id = $1 RETURNING *`,
+          [id, beiJumla, malipo]
+        );
+        const agizo = rows[0];
+
+        // Deposit is real money, so it goes into the sales ledger against the order.
+        if (malipo > 0) {
+          await client.query(
+            `INSERT INTO mauzo (mfanyakazi_id, jumla, njia_ya_malipo, risiti_no, agizo_id)
+             VALUES ($1, $2, $3, $4, $5)`,
+            [u.sub, malipo, njia_ya_malipo || 'cash', `AG-${Date.now()}-${Math.floor(Math.random() * 10000)}`, id]
+          );
+        }
+
+        const mtejaJina = order.mteja_id
+          ? (await client.query('SELECT jina FROM mteja WHERE id = $1', [order.mteja_id])).rows[0]?.jina
+          : null;
+        const maelezo = `${agizo.ladha}${agizo.ukubwa ? ` — ${agizo.ukubwa}` : ''}`;
+        await tikitishaAgizo(client, {
+          agizo_id: agizo.id,
+          jumla: agizo.bei_jumla,
+          maelezo,
+          jina: mtejaJina,
+        });
+
+        // The quote request is answered. BR-05 makes its resolution the point at
+        // which the price is real, so it closes with the price, not after.
+        await client.query(
+          `UPDATE ombi
+              SET hali = 'imekamilika',
+                  jibu = $2,
+                  alizokamilisha_na = $3,
+                  alizokamilisha_at = now(),
+                  tarehe_ya_kufunguliwa = now()
+            WHERE agizo_id = $1
+              AND jukumu_anayehudumiwa = 'owner'
+              AND hali NOT IN ('imekamilika', 'imekataa', 'imeghairi')`,
+          [id, `Bei: ${beiJumla}`, u.sub]
+        );
+        await client.query('COMMIT');
+        return agizo;
       } catch (err) {
         await client.query('ROLLBACK');
         throw err;
@@ -1989,6 +2164,15 @@ const resolvers = {
         await pool.query('SELECT hali, created_by FROM agizo_maalum WHERE id = $1', [id])
       ).rows[0];
       if (!current) throw new GraphQLError('Agizo halipo.', { extensions: { code: 'NOT_FOUND' } });
+
+      // BR-05: an order awaiting a quote is not yet a real order. It has no
+      // price, so it cannot be put into production or handed over. toa_bei is
+      // the only way out of this state, and only the owner can take it.
+      if (current.hali === 'awaiting_quote' && hali !== 'cancelled') {
+        throw new GraphQLError('Agizo bado halijauni bei na mmiliki.', {
+          extensions: { code: 'CONFLICT', hali: 'awaiting_quote' },
+        });
+      }
 
       const allowedForChef = new Set(['in_progress', 'ready']);
       const allowedForCashier = new Set(['collected']);

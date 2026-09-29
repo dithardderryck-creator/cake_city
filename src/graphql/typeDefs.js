@@ -12,6 +12,8 @@ module.exports = gql`
   }
 
   enum HaliOrder {
+    "BR-05: described by the cashier, waiting on the owner to quote a price. Not yet confirmed."
+    awaiting_quote
     ordered
     in_progress
     ready
@@ -292,9 +294,11 @@ module.exports = gql`
       created_by: ID
       created_at: DateTime
       updated_at: DateTime
-      tikiti: Tikiti
-      malipo: Mauzo
-    }
+        tikiti: Tikiti
+        malipo: Mauzo
+        "BR-05: the quote request raised for this order when the till did not price it. Present only while the order is awaiting_quote."
+        ombi_bei: Ombi
+      }
 
     # A payment taken against a special order. Recorded in the sales ledger and
     # linked to the order, so the day's takings include money collected at the
@@ -611,9 +615,10 @@ module.exports = gql`
       mapishi_id: ID
       umbo: String
       maelekezo_maalum: String
-      tarehe_ya_kuchukua: Date!
-      bei_jumla: Float!
-      malipo_ya_awali: Float!
+        tarehe_ya_kuchukua: Date!
+        "BR-05/D-28: omit this and the order is created awaiting_quote, and an owner is asked to price it. Supplying it keeps the old behaviour of pricing at the till."
+        bei_jumla: Float
+        malipo_ya_awali: Float!
       # How the deposit was paid. Optional so existing callers keep working; it
       # defaults to cash, and the till screen always sends it explicitly.
       njia_ya_malipo: NjiaMalipo
@@ -703,9 +708,10 @@ module.exports = gql`
     "The chef's tap logging: many ingredients in one submit. Stock does NOT move here — this records an estimate."
     log_matumizi_kundi(input: MatumiziKundiInput!): [KumbukumbuMatumizi!]!
     "Inventory confirms the real number. This is the point stock actually moves."
-    thibitisha_matumizi(id: ID!, kiasi_halisi: Float!): KumbukumbuMatumizi!
-    "BR-13: confirm a whole usage sheet and close its auto-raised request in one atomic step. Each line may carry an exact kiasi_halisi; a line omitted from kuchagua is confirmed at the chef's own tapped midpoint. This is the point stock actually moves."
+    thibitisha_matumizi(id: ID!, kiasi_halisi: Float!): KumbukumbuMatumizi!    "BR-13: confirm a whole usage sheet and close its auto-raised request in one atomic step. Each line may carry an exact kiasi_halisi; a line omitted from kuchagua is confirmed at the chef's own tapped midpoint. This is the point stock actually moves."
     thibitisha_matumizi_kundi(zingumiaji_id: ID!, kuchagua: [KuchaguaMatumiziInput!]): ZingumiajiMatumizi!
+    "BR-05/D-28: the owner prices an order that is awaiting_quote. This is the only way a custom cake gets its price, and it moves the order to 'ordered' so the kitchen and till can act on it."
+    toa_bei(id: ID!, bei: Float!, malipo_ya_awali: Float, njia_ya_malipo: NjiaMalipo): AgizoMaalum!
 
     unda_mapishi(input: MapishiInput!): Mapishi!
     hariri_mapishi(id: ID!, input: MapishiInput!): Mapishi!

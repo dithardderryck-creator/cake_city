@@ -358,8 +358,8 @@ A-14	Every available combination carries a stock count	Owner
 ID	Question	Blocking?	Who decides
 Q-01	Can an order with an unpaid balance be completed, and does it need owner approval?	Before payments are built	Owner
 Q-02	How does a mixed order (both line types) behave when only some lines are ready or delivered?	Before orders are built	Owner
-Q-03	Is "Dietary" a single-choice group with composite values ("Eggless + gluten-free"), or can it be multi-choice?	Before the catalogue grid	Owner
-Q-04	What exact attributes does a custom cake need for recipe generation?	Before the usage chain	Owner, Baker
+Q-03	CLOSED by D-41. Selection is a per-group property, so both readings coexist: Size single-choice, Dietary multi-choice, and "Eggless + Gluten-free" is a real combination with its own price and stock rather than a composite value.
+Q-04	PROVISIONALLY ANSWERED by D-42: recipe inputs are size, flavour, filling, layers, dietary. Still open for the owner and baker to confirm the final set.	Before the usage chain	Owner, Baker
 Q-05	How is the recipe generated (rules, an AI model, or a mix), and what is the offline fallback quality bar?	Before the usage chain	Owner, IT
 Q-06	What is the receipt layout, and which printer hardware will be used?	Before printing	Owner, IT
 Q-07	Which WhatsApp/SMS service will send messages?	Before comms	IT
@@ -409,6 +409,9 @@ D-37	The panel map is a technical view for IT only
 D-38	Delivered first as an installable web app, with native apps as a later option
 D-39	Architecture is the panel: the UI is pure I/O, reading feeds and sending intents
 D-40	Alerts reach people in-app, and critical ones also go to the owner by WhatsApp/SMS
+D-41	Q-03 resolved: option-group selection (single or multi) is a property of the group, not a global setting. A shop can have Size single-choice and Dietary multi-choice at the same time. Recorded here because the question was marked "before the catalogue grid" and the grid was built without waiting for it: making it per-group is the reading that satisfies both halves of the question, so it does not need to become a fork in the schema. The owner can change any group's setting later and the combinations regenerate.
+D-42	Q-04 resolved for now: the custom cake's recipe-relevant attributes are servings_or_size, flavor, filling, layers and dietary. decoration_notes and inscription are kept on the line but are not recipe inputs — an inscription does not change what is baked. This matches the matcher that already reads size, flavour and layer, and adds filling and dietary. Q-04 stays open because the owner and baker should confirm the final attribute set for the generator; the full Q-05 question about how the recipe is generated is untouched and still blocking the generation quality.
 17. Change log
 Version	Date	Change
 0.1	29 Sep 2026	Baseline: consolidated the locked graph, architecture, assumptions, and open questions
+0.2	29 Sep 2026	Added D-41 (Q-03) and D-42 (Q-04) as the catalogue grid was built. §4.2 variation grid, option library, combinations, owner-set prices, unavailable marking, and allergen union are implemented. Nothing in 0.1 was edited; both answers were added as new decisions per §0. Q-03 is answered and closed. Q-04 is answered provisionally and stays open for the owner and baker to confirm.

@@ -891,6 +891,129 @@ const resolvers = {
       ]);
       return rows[0] || null;
     },
+
+    // The axes this product varies on. A product with none is a grid of one.
+    makundi: async (p) => {
+      const { rows } = await pool.query(
+        `SELECT k.* FROM chagizo_kundi_kazi gk
+           JOIN chagizo_kundi k ON k.id = gk.kundi_id
+          WHERE gk.bidhaa_id = $1 AND k.active = true
+          ORDER BY gk.nafasi, k.jina`,
+        [p.id]
+      );
+      return rows;
+    },
+
+    mchanganyiko: async (p) => {
+      const { rows } = await pool.query(
+        `SELECT * FROM mchanganyiko WHERE bidhaa_id = $1
+          ORDER BY (status = 'haipatikani'), bei, id`,
+        [p.id]
+      );
+      return rows;
+    },
+
+    // Derived rather than stored: a product has a grid as soon as it has more
+    // than one combination, or as soon as any axis is attached. The sell screen
+    // asks this to decide between a plain price tile and a combination picker.
+    kuna_mchanganyiko: async (p) => {
+      const { rows } = await pool.query(
+        `SELECT (SELECT count(*) FROM mchanganyiko WHERE bidhaa_id = $1) > 1
+            OR EXISTS (SELECT 1 FROM chagizo_kundi_kazi WHERE bidhaa_id = $1)
+            AS n`,
+        [p.id]
+      );
+      return rows[0]?.n === true;
+    },
+  },
+
+  Mchanganyiko: {
+    bidhaa: async (m) => {
+      const { rows } = await pool.query('SELECT * FROM bidhaa WHERE id = $1', [m.bidhaa_id]);
+      return rows[0];
+    },
+
+    // Chosen values, each carrying its group so the picker can group them under
+    // the right axis without a second query.
+    thamani: async (m) => {
+      const { rows } = await pool.query(
+        `SELECT v.*, k.jina AS kundi_jina, k.uteuzi, k.inahitaji
+           FROM mchanganyiko_thamani mv
+           JOIN chagizo_thamani v ON v.id = mv.thamani_id
+           JOIN chagizo_kundi k ON k.id = v.kundi_id
+          WHERE mv.mchanganyiko_id = $1
+          ORDER BY k.jina, v.jina`,
+        [m.id]
+      );
+      return rows.map((r) => ({
+        thamani: r,
+        kundi: {
+          id: r.kundi_id, jina: r.kundi_jina, uteuzi: r.uteuzi, inahitaji: r.inahitaji,
+        },
+      }));
+    },
+
+    // The union of the chosen values' declared allergens. Derived on read so it
+    // cannot drift from the values, and so a value edited after an order was
+    // taken still shows its current truth on the combination itself — the order
+    // keeps the frozen copy (BR-11).
+    viambisho: async (m) => {
+      const { rows } = await pool.query(
+        `SELECT DISTINCT unnest(v.viambisho) AS a
+           FROM mchanganyiko_thamani mv
+           JOIN chagizo_thamani v ON v.id = mv.thamani_id
+          WHERE mv.mchanganyiko_id = $1
+          ORDER BY 1`,
+        [m.id]
+      );
+      return rows.map((r) => r.a).filter(Boolean);
+    },
+  },
+
+  ChagizoKundi: {
+    thamani: async (k) => {
+      const { rows } = await pool.query(
+        'SELECT * FROM chagizo_thamani WHERE kundi_id = $1 AND active = true ORDER BY jina',
+        [k.id]
+      );
+      return rows;
+    },
+
+    bidhaa_zinazotumia: async (k) => {
+      const { rows } = await pool.query(
+        'SELECT count(*)::int AS n FROM chagizo_kundi_kazi WHERE kundi_id = $1',
+        [k.id]
+      );
+      return rows[0].n;
+    },
+
+    // How many combinations this group contributes on its own. A single-choice
+    // group contributes one way per value. A multi-choice group contributes
+    // 2^n - 1 non-empty ways, which is why a multi group is the one that turns
+    // a small grid into a large one. Shown to the owner before generating,
+    // because 4 x 3 x 5 = 60 is a surprise worth knowing in advance.
+    uwezekano: async (k) => {
+      const { rows } = await pool.query(
+        `SELECT CASE
+                 WHEN uteuzi = 'moja' THEN count
+                 ELSE (1 << count) - 1
+               END AS n
+           FROM (SELECT k.uteuzi,
+                        (SELECT count(*) FROM chagizo_thamani
+                          WHERE kundi_id = k.id AND active = true)::int AS count) x`,
+        [k.id]
+      );
+      return Number(rows[0].n);
+    },
+  },
+
+  ChagizoThamani: {
+    kundi: async (v) => {
+      const { rows } = await pool.query('SELECT * FROM chagizo_kundi WHERE id = $1', [
+        v.kundi_id,
+      ]);
+      return rows[0];
+    },
   },
 
   Kategoria: {
@@ -1205,6 +1328,42 @@ const resolvers = {
       // Reuse stock.read as the least-privilege read gate; all four roles read products for their workflows.
       const activeCond = active === false ? '' : 'WHERE active = true';
       const { rows } = await pool.query(`SELECT * FROM bidhaa ${activeCond} ORDER BY aina, jina`);
+      return rows;
+    },
+
+    // One product with its whole grid. The sell screen opens a product tile and
+    // needs every axis and every combination at once; making it one query keeps
+    // the picker a single round trip rather than one per axis.
+    bidhaa_moja: async (_, { id }, ctx) => {
+      requireCan(ctx.user, 'stock.read');
+      const { rows } = await pool.query('SELECT * FROM bidhaa WHERE id = $1', [id]);
+      return rows[0] || null;
+    },
+
+    // §4.2: the shared option library, across every product. Reused rather than
+    // per-product, so 'Eggless' is one row the owner defines once.
+    makundi_zote: async (_, { active }, ctx) => {
+      requireCan(ctx.user, 'stock.read');
+      const cond = active === false ? '' : 'WHERE k.active = true';
+      const { rows } = await pool.query(
+        `SELECT k.* FROM chagizo_kundi k ${cond} ORDER BY k.jina`
+      );
+      return rows;
+    },
+
+    // One product's axes, in the order the owner arranged them, each with its
+    // values. This is what the sell screen draws: a tile becomes a sequence of
+    // choices.
+    gridi_ya_bidhaa: async (_, { bidhaa_id }, ctx) => {
+      requireCan(ctx.user, 'stock.read');
+      const { rows } = await pool.query(
+        `SELECT k.*, gk.nafasi
+           FROM chagizo_kundi_kazi gk
+           JOIN chagizo_kundi k ON k.id = gk.kundi_id
+          WHERE gk.bidhaa_id = $1 AND k.active = true
+          ORDER BY gk.nafasi, k.jina`,
+        [bidhaa_id]
+      );
       return rows;
     },
 
@@ -1793,8 +1952,285 @@ const resolvers = {
 
     futa_bidhaa: async (_, { id }, ctx) => {
       requireCan(ctx.user, 'product.manage');
+      // BR-10: archived, never deleted. An archived product leaves the sell
+      // screen but every order that already points at it still resolves.
       await pool.query('UPDATE bidhaa SET active = false WHERE id = $1', [id]);
       return true;
+    },
+
+    // ---------------------------------------------------- option library ---
+    // A-01: only the owner manages the catalogue. The option library is kept
+    // behind product.manage rather than a permission of its own, because the
+    // blueprint's matrix gives exactly one role this capability and inventing
+    // a second gate here would let someone else reshape the catalogue by the
+    // back door.
+
+    ongeza_kundi: async (_, { input }, ctx) => {
+      requireCan(ctx.user, 'product.manage');
+      const dupe = await pool.query(
+        'SELECT id FROM chagizo_kundi WHERE LOWER(jina) = LOWER($1)',
+        [input.jina]
+      );
+      if (dupe.rows[0]) {
+        throw new GraphQLError(`Kundi "${input.jina}" tayari kipo.`, {
+          extensions: { code: 'BAD_REQUEST', existing_id: dupe.rows[0].id },
+        });
+      }
+      const { rows } = await pool.query(
+        `INSERT INTO chagizo_kundi (jina, uteuzi, inahitaji, created_by)
+         VALUES ($1, $2, $3, $4) RETURNING *`,
+        [input.jina, input.uteuzi || 'moja', input.inahitaji ?? true, ctx.user.sub]
+      );
+      return rows[0];
+    },
+
+    hariri_kundi: async (_, { id, input }, ctx) => {
+      requireCan(ctx.user, 'product.manage');
+      const { rows } = await pool.query(
+        `UPDATE chagizo_kundi SET jina = $2, uteuzi = $3, inahitaji = $4
+          WHERE id = $1 RETURNING *`,
+        [id, input.jina, input.uteuzi || 'moja', input.inahitaji ?? true]
+      );
+      if (!rows[0]) throw new GraphQLError('Kundi halipo.', { extensions: { code: 'NOT_FOUND' } });
+      return rows[0];
+    },
+
+    ongeza_thamani: async (_, { input }, ctx) => {
+      requireCan(ctx.user, 'product.manage');
+      // Allergens are stored sorted and deduped so two people typing the same
+      // allergen in different orders produce the same row, and so a
+      // combination's union is a clean list rather than whatever order the
+      // values happened to be written in.
+      const viambisho = [...new Set((input.viambisho || []).map((a) => String(a).trim()).filter(Boolean))]
+        .sort();
+      const { rows } = await pool.query(
+        `INSERT INTO chagizo_thamani (kundi_id, jina, viambisho, created_by)
+         VALUES ($1, $2, $3, $4) RETURNING *`,
+        [input.kundi_id, input.jina, viambisho, ctx.user.sub]
+      );
+      return rows[0];
+    },
+
+    futa_thamani: async (_, { id }, ctx) => {
+      requireCan(ctx.user, 'product.manage');
+      // Retired rather than deleted, for the same reason products are (BR-10):
+      // a value already chosen on a live combination must keep resolving.
+      // Existing combinations keep it; new grids simply stop offering it.
+      await pool.query('UPDATE chagizo_thamani SET active = false WHERE id = $1', [id]);
+      return true;
+    },
+
+    weka_makundi_za_bidhaa: async (_, { input }, ctx) => {
+      requireCan(ctx.user, 'product.manage');
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        // Replace the whole set, so the order the owner sees is exactly the
+        // order they sent. An omitted group is a group they removed.
+        await client.query('DELETE FROM chagizo_kundi_kazi WHERE bidhaa_id = $1', [input.bidhaa_id]);
+        for (const [i, kid] of input.kundi_id.entries()) {
+          await client.query(
+            `INSERT INTO chagizo_kundi_kazi (bidhaa_id, kundi_id, nafasi)
+             VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+            [input.bidhaa_id, kid, i + 1]
+          );
+        }
+        await client.query('COMMIT');
+      } catch (e) {
+        await client.query('ROLLBACK');
+        throw e;
+      } finally {
+        client.release();
+      }
+      const { rows } = await pool.query('SELECT * FROM bidhaa WHERE id = $1', [input.bidhaa_id]);
+      if (!rows[0]) throw new GraphQLError('Bidhaa haipo.', { extensions: { code: 'NOT_FOUND' } });
+      return rows[0];
+    },
+
+    // ------------------------------------------------------- the grid ------
+    /**
+     * §4.2: "Generated by the system from the option values the owner selects
+     * for a product, so the owner fills in prices instead of creating rows."
+     *
+     * The cartesian product of the selected values, grouped by axis. Every new
+     * row starts unavailable, because D-27 leaves the price to the owner and an
+     * unpriced combination has no business being sellable. Re-running is safe
+     * and additive: combinations that already exist are left exactly as they
+     * are, so re-generating after adding a value never discards a price the
+     * owner has already set.
+     */
+    tengeneza_mchanganyiko: async (_, { input }, ctx) => {
+      requireCan(ctx.user, 'product.manage');
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const bidhaa = (await client.query('SELECT * FROM bidhaa WHERE id = $1', [input.bidhaa_id])).rows[0];
+        if (!bidhaa) throw new GraphQLError('Bidhaa haipo.', { extensions: { code: 'NOT_FOUND' } });
+
+        if (!input.thamani || input.thamani.length === 0) {
+          throw new GraphQLError('Chagua angalau thamani moja.', {
+            extensions: { code: 'BAD_REQUEST' },
+          });
+        }
+
+        // Only the values the caller named, and only active ones. A value from
+        // another product's group would produce a combination that violates the
+        // shape of the grid, and the trigger would catch it with a message
+        // aimed at a form rather than at a programmer.
+        const vals = (
+          await client.query(
+            `SELECT v.id, v.jina, v.kundi_id, k.jina AS kundi_jina, k.uteuzi, k.inahitaji
+               FROM chagizo_thamani v
+               JOIN chagizo_kundi k ON k.id = v.kundi_id
+              WHERE v.id = ANY($1::int[]) AND v.active = true AND k.active = true`,
+            [input.thamani]
+          )
+        ).rows;
+        if (vals.length !== new Set(input.thamani).size) {
+          throw new GraphQLError('Baadhi ya thamani hazipo au hazipatikani.', {
+            extensions: { code: 'BAD_REQUEST' },
+          });
+        }
+
+        // Group by axis, keeping the order the caller sent, so the generated
+        // combinations come out in a predictable order. The axis's selection
+        // type is kept on the group, because it decides what one axis
+        // contributes to the grid (see waysFor below).
+        const byGroup = new Map();
+        for (const v of vals) {
+          if (!byGroup.has(v.kundi_id)) {
+            byGroup.set(v.kundi_id, { uteuzi: v.uteuzi, thamani: [] });
+          }
+          byGroup.get(v.kundi_id).thamani.push(v);
+        }
+        const groups = [...byGroup.values()];
+        for (const g of groups) g.thamani.sort((a, b) => a.id - b.id);
+
+        // What one axis contributes to the grid. This is where Q-03 bites: a
+        // single-choice axis offers one way per value, but a multi-choice axis
+        // offers every non-empty subset of its values, because "Eggless and
+        // Gluten-free" is a different thing to bake and therefore a different
+        // thing to stock and price. Treating a multi group as single would
+        // quietly throw away half the grid the owner asked for.
+        const waysFor = (g) => {
+          if (g.uteuzi !== 'nyingi') return g.thamani.map((v) => [v]);
+          const ways = [];
+          for (let mask = 1; mask < 1 << g.thamani.length; mask += 1) {
+            ways.push(g.thamani.filter((_, i) => mask & (1 << i)));
+          }
+          return ways;
+        };
+
+        const perGroup = groups.map(waysFor);
+        const size = perGroup.reduce((n, ways) => n * ways.length, 1);
+        if (size > 500) {
+          throw new GraphQLError(
+            `Hiyo ingeunda ${size} mchanganyiko. Chagua thamani kidogo kwa wakati mmoja.`,
+            { extensions: { code: 'BAD_REQUEST' } }
+          );
+        }
+
+        // Readable label, frozen at creation so an old order still reads
+        // correctly after a rename (BR-11). Values are joined per axis so a
+        // multi axis shows "Eggless + Gluten-free" rather than one of them
+        // silently dropped. The combo arrives flat, so regroup by axis here.
+        const labelFor = (flatCombo) => {
+          const byKundi = new Map();
+          for (const v of flatCombo) {
+            if (!byKundi.has(v.kundi_id)) byKundi.set(v.kundi_id, []);
+            byKundi.get(v.kundi_id).push(v.jina);
+          }
+          return [bidhaa.jina, ...byKundi.values().map((names) => names.join(' + '))]
+            .filter(Boolean)
+            .join(', ');
+        };
+
+        // Walk the axes, and within each axis its ways. A way is a list of
+        // values, so a multi axis contributes more than one value to a single
+        // combination.
+        const combos = perGroup
+          .reduce((acc, ways) => acc.flatMap((c) => ways.map((w) => [...c, w])), [[]])
+          .map((nested) => nested.flat());
+
+        const created = [];
+        for (const combo of combos) {
+          const ids = combo.map((v) => v.id);
+          // Already generated? Leave it. The point of re-running is to add the
+          // combinations that are new, not to reset the ones the owner priced.
+          const existing = (
+            await client.query(
+              `SELECT m.id FROM mchanganyiko m
+                 JOIN mchanganyiko_thamani mv ON mv.mchanganyiko_id = m.id
+                WHERE m.bidhaa_id = $1 AND mv.thamani_id = ANY($2::int[])
+                GROUP BY m.id HAVING count(*) = $3`,
+              [input.bidhaa_id, ids, ids.length]
+            )
+          ).rows;
+          if (existing.length) continue;
+
+          const bei = input.bei_mwanzoni != null ? input.bei_mwanzoni : bidhaa.bei;
+          const ins = (
+            await client.query(
+              `INSERT INTO mchanganyiko (bidhaa_id, bei, status, maelezo, created_by)
+               VALUES ($1, $2, 'haipatikani', $3, $4) RETURNING *`,
+              [input.bidhaa_id, bei, labelFor(combo), ctx.user.sub]
+            )
+          ).rows[0];
+          for (const v of combo) {
+            await client.query(
+              `INSERT INTO mchanganyiko_thamani (mchanganyiko_id, thamani_id)
+               VALUES ($1, $2)`,
+              [ins.id, v.id]
+            );
+          }
+          created.push(ins);
+        }
+
+        await client.query('COMMIT');
+        return created;
+      } catch (e) {
+        await client.query('ROLLBACK');
+        throw e;
+      } finally {
+        client.release();
+      }
+    },
+
+    /**
+     * D-27: the owner sets each price by hand. Bulk because a grid of 24 is not
+     * something anyone should type one row at a time — §4.2 asks for "fill a
+     * column, copy a price across fillings" as a first-class helper.
+     */
+    weka_bei_ya_mchanganyiko: async (_, { input }, ctx) => {
+      requireCan(ctx.user, 'product.manage');
+      const bei = Number(input.bei);
+      if (!Number.isFinite(bei) || bei < 0) {
+        throw new GraphQLError('Bei lazima iwe namba isiyo chini ya sifuri.', {
+          extensions: { code: 'BAD_REQUEST' },
+        });
+      }
+      const { rows } = await pool.query(
+        `UPDATE mchanganyiko SET bei = $2 WHERE id = ANY($1::int[]) RETURNING *`,
+        [input.mchanganyiko, bei]
+      );
+      return rows;
+    },
+
+    /**
+     * §4.2: "A combination that should not exist is marked unavailable (this
+     * replaces any rules engine)." So retiring one is a normal, expected
+     * action, not a deletion.
+     */
+    weka_hali_ya_mchanganyiko: async (_, { id, status }, ctx) => {
+      requireCan(ctx.user, 'product.manage');
+      const { rows } = await pool.query(
+        'UPDATE mchanganyiko SET status = $2 WHERE id = $1 RETURNING *',
+        [id, status]
+      );
+      if (!rows[0]) {
+        throw new GraphQLError('Mchanganyiko haipo.', { extensions: { code: 'NOT_FOUND' } });
+      }
+      return rows[0];
     },
 
     ongeza_malighafi: async (_, { input }, ctx) => {

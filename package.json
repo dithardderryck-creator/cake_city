@@ -22,7 +22,8 @@
     "verify:chef": "node scripts/verify-chef-and-requests.js",
     "verify:matcher": "node scripts/verify-matcher.js",
     "verify:br13": "node scripts/verify-usage-request.js",
-    "verify:br05": "node scripts/verify-quote-flow.js"
+    "verify:br05": "node scripts/verify-quote-flow.js",
+    "verify:grid": "node scripts/verify-catalogue-grid.js"
   },
   "dependencies": {
     "@apollo/server": "^4.11.3",

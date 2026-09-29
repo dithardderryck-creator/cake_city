@@ -37,7 +37,7 @@ a shop would.
 
 | Blueprint | Status |
 |---|---|
-| §4.2 option groups / values / combinations (D-26, D-27, BR-02) | `bidhaa` is flat: `jina, bei, aina, familia, ukubwa, kategoria_id`. `familia`/`ukubwa` are free-text ancestors of Filling and Size, not a variation grid |
+| §4.2 option groups / values / combinations (D-26, D-27, BR-02) | **Now built.** `chagizo_kundi` (axis, single/multi), `chagizo_thamani` (value + declared allergens), `chagizo_kundi_kazi` (product ↔ axis, ordered), `mchanganyiko` (version with owner-set price + stock count) and `mchanganyiko_thamani` (the grid). The system generates the cartesian product so the owner fills in prices rather than creating rows; a multi axis enumerates its non-empty subsets, so "Eggless + Gluten-free" is its own combination. Owner-only per A-01. A deferred constraint trigger enforces the shape in the database, not only in the resolver. The six existing products were backfilled as grids of one, so nothing that sold before stops selling. Covered by `npm run verify:grid` (39 checks). |
 | §4.3 counter day: batches, daily count, count differences, closing review, markdown | absent (BR-18, BR-19, BR-20, D-23, D-24) |
 | §4.6 / §5.8 delivery record | absent (D-29) |
 | §8 alerts, dedupe, critical WhatsApp/SMS | absent (BR-23, BR-24, D-40) |

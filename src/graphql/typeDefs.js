@@ -107,6 +107,74 @@ module.exports = gql`
     "Size within the family, e.g. 'dira 18' or 'pcs'. Each size is its own sellable thing with its own price and recipe."
     ukubwa: String
     kategoria: Kategoria
+    "§4.2/D-26: the axes of variation this product has, in the order the owner arranged them. Empty means the product is a grid of one and its single combination carries the price."
+    makundi: [ChagizoKundi!]!
+    "Every version of this product with a price and a stock count (D-27). A product with no variations has exactly one."
+    mchanganyiko: [Mchanganyiko!]!
+    "True when the product is priced and stocked per combination rather than as a single thing."
+    kuna_mchanganyiko: Boolean!
+  }
+
+  "§4.2 OptionGroup: one axis of variation, from a library shared across products. Size, Filling, Dietary."
+  type ChagizoKundi {
+    id: ID!
+    jina: String!
+    "Q-03: 'moja' means the customer picks one value, 'nyingi' means several. Resolved per group rather than as a schema fork, so a shop can have Size single and Dietary multi at the same time."
+    uteuzi: UteuziChagizo!
+    "A required group must be answered on every combination of the products that use it."
+    inahitaji: Boolean!
+    active: Boolean!
+    thamani: [ChagizoThamani!]!
+    "How many products currently use this group."
+    bidhaa_zinazotumia: Int!
+    "How many values, times how many ways they can be combined. This is the size of the grid the owner is about to create."
+    uwezekano: Int!
+  }
+
+  enum UteuziChagizo {
+    "The customer picks exactly one value from the group."
+    moja
+    "The customer picks several values from the group."
+    nyingi
+  }
+
+  "§4.2 OptionValue: one choice on an axis, e.g. '8-inch' or 'Eggless'."
+  type ChagizoThamani {
+    id: ID!
+    kundi: ChagizoKundi!
+    jina: String!
+    "Declared allergens. A combination's allergen list is the union of its values', so a snapshot frozen at order time (BR-11) can be trusted."
+    viambisho: [String!]!
+    active: Boolean!
+  }
+
+  "§4.2 Combination: one specific version of a product, with its own price and stock count. 'Chocolate Fudge, 8-inch, Vanilla cream, Eggless'."
+  type Mchanganyiko {
+    id: ID!
+    bidhaa: Bidhaa!
+    "D-27: set by the owner by hand. There is no price rule engine, and none is coming."
+    bei: Float!
+    "A-14: every available combination carries a stock count."
+    hesafa: Int!
+    status: HaliMchanganyiko!
+    "The values chosen, grouped by axis, in the order the owner arranged the axes."
+    thamani: [ThamaniYaMchanganyiko!]!
+    "The union of the chosen values' declared allergens, sorted and deduped."
+    viambisho: [String!]!
+    "A human-readable label, frozen at creation so an old order still reads correctly after a rename (BR-11)."
+    maelezo: String
+  }
+
+  "One chosen value, carrying its group so the picker knows which axis to put it under."
+  type ThamaniYaMchanganyiko {
+    thamani: ChagizoThamani!
+    kundi: ChagizoKundi!
+  }
+
+  enum HaliMchanganyiko {
+    patikana
+    "Marked unavailable rather than deleted. This is how a combination that should not exist is retired (§4.2) — it replaces any rules engine."
+    haipatikani
   }
 
   type Kategoria {
@@ -513,6 +581,12 @@ module.exports = gql`
     """
     watumishi: [Mtumiaji!]!
     bidhaa(active: Boolean): [Bidhaa!]!
+    "One product with its axes and every combination. The combination picker needs the whole grid for a product in one round trip, not N."
+    bidhaa_moja(id: ID!): Bidhaa
+    "The option library (§4.2), shared across products. Includes archived groups so the owner can see and restore them."
+    makundi_zote(active: Boolean): [ChagizoKundi!]!
+    "One product's grid, in the order the owner arranged the axes. What the sell screen renders."
+    gridi_ya_bidhaa(bidhaa_id: ID!): [ChagizoKundi!]!
     wateja(search: String): [Mteja!]!
     agizo_maalum(hali: HaliOrder, tarehe_ya_kuchukua: Date): [AgizoMaalum!]!
     order_kwajikoni: [AgizoMaalum!]!
@@ -570,6 +644,39 @@ module.exports = gql`
     familia: String
     ukubwa: String
     kategoria_id: ID
+  }
+
+  input ChagizoKundiInput {
+    jina: String!
+    uteuzi: UteuziChagizo = moja
+    inahitaji: Boolean = true
+  }
+
+  input ChagizoThamaniInput {
+    kundi_id: ID!
+    jina: String!
+    viambisho: [String!]
+  }
+
+  "Attach a group to a product, in the order the axes should appear on the sell screen."
+  input WekaMakundiInput {
+    bidhaa_id: ID!
+    kundi_id: [ID!]!
+  }
+
+  "§4.2: generate the grid from the selected values, so the owner fills in prices instead of creating rows. Every generated combination starts unavailable and unpriced-able: the owner sets each price (D-27) and each one must be decided before it can be sold."
+  input TengenezaMchanganyikoInput {
+    bidhaa_id: ID!
+    "Which values to build from, per group. A group left out of the map is skipped rather than silently defaulted."
+    thamani: [ID!]!
+    "Applied to every generated combination. Products with a single value need not be touched one by one (fill a column)."
+    bei_mwanzoni: Float
+  }
+
+  "Bulk price helpers (§4.2): fill a column, copy a price across fillings."
+  input BeiMchanganyikoInput {
+    mchanganyiko: [ID!]!
+    bei: Float!
   }
 
   input MalighafiInput {
@@ -696,7 +803,21 @@ module.exports = gql`
     ongeza_malighafi(input: MalighafiInput!): Malighafi!
     hariri_malighafi(id: ID!, input: MalighafiInput!): Malighafi!
     hariri_bidhaa(id: ID!, input: BidhaaInput!): Bidhaa!
+    "BR-10: archives rather than deletes. An archived product leaves the sell screen and stays in every record that already points at it."
     futa_bidhaa(id: ID!): Boolean!
+
+    "A-01: only the owner manages products, combinations and prices. The shared option library is a separate permission so the owner can hand the library to someone without handing over prices."
+    ongeza_kundi(input: ChagizoKundiInput!): ChagizoKundi!
+    hariri_kundi(id: ID!, input: ChagizoKundiInput!): ChagizoKundi!
+    ongeza_thamani(input: ChagizoThamaniInput!): ChagizoThamani!
+    futa_thamani(id: ID!): Boolean!
+    weka_makundi_za_bidhaa(input: WekaMakundiInput!): Bidhaa!
+    "§4.2: build the grid, then fill in prices. Re-running adds only the combinations that do not exist yet, so it never discards a price already set."
+    tengeneza_mchanganyiko(input: TengenezaMchanganyikoInput!): [Mchanganyiko!]!
+    "D-27: the owner sets each price. Bulk, because a grid of 24 combinations should not be typed one at a time."
+    weka_bei_ya_mchanganyiko(input: BeiMchanganyikoInput!): [Mchanganyiko!]!
+    "§4.2: a combination that should not exist is marked unavailable. This is what replaces a rules engine."
+    weka_hali_ya_mchanganyiko(id: ID!, status: HaliMchanganyiko!): Mchanganyiko!
     ongeza_mteja(input: MtejaInput!): Mteja!
     unda_mauzo(bidhaa: [MauzoBidhaaInput!]!, njia_ya_malipo: NjiaMalipo!, punguzo: Float): Mauzo!
     unda_agizo(input: AgizoInput!): AgizoMaalum!

@@ -7,4 +7,15 @@ cake_shop_pos_spec.md
 node_modules
 web/node_modules
 web/dist
-api
+
+# Database dumps. These contain the shop's real sales ledger, so they must never
+# be uploaded to a CDN even as build artefacts.
+backups
+
+# Verification scripts are run from a checkout against a known database. They are
+# not part of the running system and only add build weight.
+scripts
+
+# Local notes and design history, not needed at runtime.
+vision.txt
+cakecity-master-blueprint-v0.1.md

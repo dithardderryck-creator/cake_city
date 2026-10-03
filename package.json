@@ -24,7 +24,8 @@
     "verify:br13": "node scripts/verify-usage-request.js",
     "verify:br05": "node scripts/verify-quote-flow.js",
     "verify:grid": "node scripts/verify-catalogue-grid.js",
-    "verify:orderlines": "node scripts/verify-order-lines.js"
+    "verify:orderlines": "node scripts/verify-order-lines.js",
+    "login:reset": "node scripts/reset-login-lockout.js"
   },
   "dependencies": {
     "@apollo/server": "^4.11.3",

@@ -2196,7 +2196,7 @@ const resolvers = {
       const accountKey = `id:${id}`;
       const ipKey = `ip:${ip}`;
 
-      if (isLocked(accountKey) || isLocked(ipKey)) {
+      if (await isLocked(accountKey) || (await isLocked(ipKey))) {
         throw new GraphQLError('Mwingiliano umefungiwa kwa muda. Jaribu tena baadaye.', {
           extensions: { code: 'TOO_MANY_ATTEMPTS' },
         });
@@ -2210,11 +2210,14 @@ const resolvers = {
       // Always run a bcrypt comparison so a missing/inactive account and a
       // wrong PIN take the same time — otherwise response timing alone
       // reveals which staff IDs exist.
-      const hash = u ? u.pin_hash : '$2a$10$invalidinvalidinvalidinvalidinvalidinvalidinvalidinvalidin';
+      const hash = u ? u.pin_hash : '$2a$10$invalidinvalidinvalidinvalidinvalidinvalidinvalidinvalidinvalidin';
       const pinOk = await bcrypt.compare(String(pin ?? ''), hash);
 
       if (!u || !pinOk) {
-        const left = Math.min(recordFailure(accountKey), recordFailure(ipKey));
+        const left = Math.min(
+          await recordFailure(accountKey),
+          await recordFailure(ipKey)
+        );
         throw new GraphQLError(
           left > 0
             ? `PIN si sahihi. Majaribio ${left} yaliyobaki.`
@@ -2223,8 +2226,8 @@ const resolvers = {
         );
       }
 
-      clear(accountKey);
-      clear(ipKey);
+      await clear(accountKey);
+      await clear(ipKey);
       // BR-26: this till identifies itself once, at login, and the claim rides in
       // the token from then on. Claiming it per request instead would let a
       // client ask for another device's prefix, and two tills would then share a

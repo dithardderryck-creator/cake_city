@@ -99,8 +99,10 @@ async function main() {
     if (codeOf(good) === 'TOO_MANY_ATTEMPTS') {
       console.error(
         '\n  This IP is already locked out from a previous verification run.\n' +
-          '  The lockout is held in server memory for 15 minutes — restart the\n' +
-          '  API (npm start) and run this again.\n'
+          '  The lockout is stored in the database and deliberately survives a\n' +
+          '  restart — that is what stops an attacker resetting it by waiting\n' +
+          '  for a deploy. Clear it with:\n\n' +
+          '    npm run login:reset\n'
       );
       await pool.end();
       process.exit(1);
@@ -572,23 +574,57 @@ async function main() {
   const correctButLocked = await gql(`mutation{login(id:${lockoutId},pin:"${FIXTURE_PIN}"){token}}`);
   check('A1 correct PIN refused while locked out', codeOf(correctButLocked) === 'TOO_MANY_ATTEMPTS', `${codeOf(correctButLocked)} ${msgOf(correctButLocked)}`);
 
-  // The lockout is per-account AND per-IP, and the per-IP counter is what a
-  // real deployment relies on to stop one machine grinding many accounts. It
-  // therefore also blocks every other login from this address for the window,
-  // which no test can avoid. So the owner login is expected to fail here.
-  // What matters is that the throwaway account is what got locked, not the
-  // real owner, and that the state is in-memory and clears on restart.
+    // The lockout is per-account AND per-IP, and the per-IP counter is what a
+    // real deployment relies on to stop one machine grinding many accounts. It
+    // therefore also blocks every other login from this address for the window,
+    // which no test can avoid. So the owner login is expected to fail here.
+    // What matters is that the throwaway account is what got locked, not the
+    // real owner, and that the state lives in the database rather than in this
+    // process's memory — see the durability checks below, which prove a lockout
+    // outlives a restart and is visible to a second instance.
   const ownerDuring = await gql(`mutation{login(id:1,pin:"${ownerPin}"){token}}`);
   check(
     'A1 this IP is throttled by design after the lockout test',
     codeOf(ownerDuring) === 'TOO_MANY_ATTEMPTS',
     `${codeOf(ownerDuring)} ${msgOf(ownerDuring)}`
   );
-  const ownerAccountIntact = await sql('SELECT active FROM mtumiaji WHERE id = 1');
-  check('A1 the real owner account itself is not locked', ownerAccountIntact[0]?.active === true);
+    const ownerAccountIntact = await sql('SELECT active FROM mtumiaji WHERE id = 1');
+    check('A1 the real owner account itself is not locked', ownerAccountIntact[0]?.active === true);
 
-  await sql("DELETE FROM mtumiaji WHERE jina IN ('ZZ Verify Chef','ZZ Verify Lockout')");
-  console.log('  (lockout state is in-memory: restart the API before the next suite)');
+    // A1 durability. The lockout has to be stronger than the process that
+    // created it, otherwise the throttle is decoration once the API is deployed
+    // for more than one instance. Two failures it must not have:
+    //
+    //   - living in memory, so a restart or a redeploy wipes an ongoing attack
+    //   - living in one instance, so an attacker just retries against a clean one
+    //
+    // Both are checked the only way that means anything: by asking a brand-new
+    // copy of the module, with none of this process's state, whether the
+    // account is still locked. A module-level Map would answer "no" here.
+    const lockoutRows = await sql(
+      "SELECT kituo FROM jaribio_la_ingia WHERE kituo LIKE 'id:%' AND hadi_kufungwa > now()"
+    );
+    check(
+      'A1 lockout is stored in the database, not in process memory',
+      lockoutRows.some((r) => String(r.kituo) === `id:${lockoutId}`),
+      `rows: ${JSON.stringify(lockoutRows)}`
+    );
+
+    const freshPath = require.resolve('../src/auth/loginAttempts');
+    delete require.cache[freshPath];
+    const freshLimiter = require('../src/auth/loginAttempts');
+    const stillLocked = await freshLimiter.isLocked(`id:${lockoutId}`);
+    check(
+      'A1 a second, independent instance still sees the lockout',
+      stillLocked === true,
+      `isLocked from a fresh module = ${stillLocked}`
+    );
+    await freshLimiter.clear(`id:${lockoutId}`);
+
+    await sql("DELETE FROM mtumiaji WHERE jina IN ('ZZ Verify Chef','ZZ Verify Lockout')");
+    console.log(
+      '  (lockout state lives in the database: run `npm run login:reset` before the next suite)'
+    );
 
   console.log(`\n${passed} passed, ${failed} failed\n`);
   if (failed > 0) {

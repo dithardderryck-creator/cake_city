@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 # Runs both verification suites against a live API.
 #
-# The API is restarted between them on purpose. The brute-force lockout check
-# in verify-fixes.js deliberately trips the per-IP throttle, and that state is
-# held in server memory for 15 minutes. Without a restart, the second suite
-# cannot authenticate as the owner and every check in it fails for a reason
-# that has nothing to do with the code under test.
+# The API is restarted between them, and the login throttle is cleared, on
+# purpose. The brute-force lockout check in verify-fixes.js deliberately trips
+# the per-IP throttle. That state lives in the database so it cannot be wiped by
+# a redeploy — otherwise an attacker facing more than one instance would get a
+# fresh set of attempts every time one was deployed — which means a restart is no
+# longer enough to release it. Without the reset below, every later suite fails
+# to authenticate as the owner, for a reason that has nothing to do with the code
+# under test.
 #
 # A single API process is reused within each suite so the suites stay fast.
 set -uo pipefail
@@ -25,9 +28,9 @@ start_api() {
   # Refuse to start if the port is taken. Without this check the spawned server
   # dies with EADDRINUSE, the health probe below is answered by whatever else
   # owns the port, and the suites quietly run against that other process. The
-  # lockout test then throttles an IP in someone else's long-lived dev server,
-  # which locks the operator out of their own browser for 15 minutes and fails
-  # the next suite for a reason that has nothing to do with the code.
+  # lockout test then throttles an IP against someone else's long-lived dev
+  # server, which locks that operator out for 15 minutes and fails the next
+  # suite for a reason that has nothing to do with the code.
   if port_in_use; then
     echo "Port 4000 is already in use, so these suites cannot run." >&2
     echo "Stop the other server first (an 'npm start' or 'npm run dev' you left" >&2
@@ -87,6 +90,14 @@ status=0
     npm run "$suite"
     rc=$?
     stop_api
+    # verify trips the throttle deliberately. Release it before the next suite,
+    # and warn loudly rather than carrying a lockout into the developer's next
+    # session — where it would look like the application had locked them out.
+    if npm run --silent login:reset >/dev/null 2>&1; then
+      :
+    else
+      echo "Could not clear login throttling. The next suite may fail to log in." >&2
+    fi
     if [ $rc -ne 0 ]; then
       status=$rc
       echo "=== $suite FAILED ==="

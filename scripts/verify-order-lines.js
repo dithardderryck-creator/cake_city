@@ -622,6 +622,21 @@ async function main() {
   check('catalogue stock decrements on collect', stockAfter === stockBefore - 3,
     `${stockBefore} → ${stockAfter}`);
 
+  // Collecting is a stock movement, so collecting twice would move it twice. A
+  // double tap or a retry after a dropped connection is the likely cause, and
+  // neither should quietly oversell whatever was on that line.
+  const stockBeforeSecond = stockAfter;
+  const collectTwice = await gql(
+    `mutation ($id: ID!) { chukua_agizo(id: $id) { id hali } }`,
+    owner,
+    { id: histOrder.id }
+  );
+  const stockAfterSecond = Number((await sql('SELECT hesafa FROM mchanganyiko WHERE id = $1', [combo.id]))[0].hesafa);
+  check('BR-03: collecting an already-collected order is refused', codeOf(collectTwice) === 'CONFLICT',
+    msgOf(collectTwice));
+  check('BR-03: and it does not decrement stock a second time', stockAfterSecond === stockBeforeSecond,
+    `${stockBeforeSecond} → ${stockAfterSecond}`);
+
   // badge_hali_order(collected) must take the same stock path (no bypass).
   const stockBadgeBefore = Number((await sql('SELECT hesafa FROM mchanganyiko WHERE id = $1', [combo.id]))[0].hesafa);
   const badgeOrder = await mkOrder({

@@ -3418,6 +3418,17 @@ const resolvers = {
             extensions: { code: 'BAD_REQUEST' },
           });
         }
+        // BR-03: collecting decrements catalogue stock, so collecting twice would
+        // decrement it twice — quietly overselling whatever was on that line. A
+        // second collect is also almost always a double tap or a retry after a
+        // dropped connection, neither of which should look like a second order.
+        // Refused rather than made idempotent: doing nothing silently would still
+        // let a caller believe the handover happened again.
+        if (cur.hali === 'collected') {
+          throw new GraphQLError('Agizo limechukuliwa tayari.', {
+            extensions: { code: 'CONFLICT', hali: 'collected' },
+          });
+        }
         if (cur.hali === 'awaiting_quote') {
           throw new GraphQLError('Agizo bado halijauni bei na mmiliki.', {
             extensions: { code: 'CONFLICT' },

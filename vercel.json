@@ -5,11 +5,14 @@
   "devCommand": "npm --prefix web run dev",
   "outputDirectory": "web/dist",
   "functions": {
-    "api/*.js": {
+    "api/**/*.js": {
       "memory": 1024,
       "maxDuration": 30
     }
   },
+  "crons": [
+    { "path": "/api/cron/reminders", "schedule": "0 6 * * *" }
+  ],
   "rewrites": [
     { "source": "/graphql", "destination": "/api/index" },
     { "source": "/health", "destination": "/api/health" },

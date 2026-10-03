@@ -2,5 +2,11 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "installCommand": "npm install && npm --prefix web install",
   "buildCommand": "npm run build --prefix web",
-  "outputDirectory": "web/dist"
+  "outputDirectory": "web/dist",
+  "env": {
+    "DATABASE_URL": "@database_url",
+    "JWT_SECRET": "@jwt_secret",
+    "CAKE_OWNER_JINA": "Demo Cake Shop",
+    "CAKE_OWNER_PIN": "1234"
+  }
 }

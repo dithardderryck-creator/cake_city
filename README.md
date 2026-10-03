@@ -68,11 +68,26 @@ DATABASE_URL=postgresql://USER:PASSWORD@localhost:5432/cakecity
 PORT=4000
 JWT_SECRET=<long random string>
 CAKE_OWNER_JINA=Mmiliki Mkuu
-CAKE_OWNER_PIN=1234
+CAKE_OWNER_PIN=<random 4+ digits>
 ```
 
 > `.env` is gitignored. **Never commit it** — it holds the owner's PIN and the JWT
 > signing secret.
+>
+> Generate both secrets rather than inventing them:
+>
+> ```bash
+> # JWT signing secret
+> node -e "console.log(require('crypto').randomBytes(48).toString('hex'))"
+> # owner PIN
+> node -e "console.log(require('crypto').randomInt(1000, 10000))"
+> ```
+>
+> Do not pick `1234`, or any other value that appears in this repository. The
+> owner account can delete staff, change prices and read the day's takings, and
+> this file is public — a PIN chosen from anything written down here is a PIN
+> anyone can walk in with. The owner can change the PIN from the app after the
+> first login.
 
 ### 3. Install
 

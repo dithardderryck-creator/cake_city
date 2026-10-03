@@ -64,6 +64,114 @@ async function runCommand(cmd, args, cwd = process.cwd()) {
   });
 }
 
+// A throwaway Postgres in Docker, on a port unlikely to collide with a real
+// local install. Container name is fixed so a re-run reuses the same volume
+// instead of piling up containers, and so `docker rm -f` is enough to undo it.
+const DEMO_DB_CONTAINER = 'cakecity-demo-db';
+const DEMO_DATABASE_URL = 'postgresql://cakecity:cakecity@localhost:5433/cakecity';
+
+/**
+ * Look for a database that is already configured, before inventing one.
+ *
+ * .env.local is checked first because that is where a developer's real, already
+ * working shop database will be, and quietly using it is the whole point: the
+ * demo should show their actual catalogue.
+ *
+ * Returns { url, source } or null.
+ */
+function readDatabaseUrlFromEnvFiles(projectRoot) {
+  for (const name of ['.env.local', '.env']) {
+    const file = path.join(projectRoot, name);
+    if (!fs.existsSync(file)) continue;
+    const match = fs
+      .readFileSync(file, 'utf8')
+      .match(/^\s*DATABASE_URL\s*=\s*(.+)$/m);
+    if (!match) continue;
+    const url = match[1].trim().replace(/^["']|["']$/g, '');
+    // A SQLite URL here means someone copied the old broken template. Skipping it
+    // is better than passing it on and failing later with a confusing message.
+    if (!url || /^sqlite:/i.test(url)) continue;
+    return { url, source: name };
+  }
+  return null;
+}
+
+/**
+ * Start a Postgres for the demo, or report that it could not.
+ *
+ * Returns true if a usable database is listening by the time this returns. Any
+ * failure is reported by the caller, because the useful advice (write a .env by
+ * hand) is the same whether Docker is missing, not running, or out of memory.
+ */
+async function tryStartDemoDatabase(projectRoot) {
+  try {
+    require('child_process').execSync('docker info', { stdio: 'ignore' });
+  } catch {
+    info('Docker is not running');
+    return false;
+  }
+
+  // Reuse a container left by an earlier run.
+  const existing = await new Promise((resolve) => {
+    const ps = spawn('docker', ['ps', '-aq', '-f', `name=^${DEMO_DB_CONTAINER}$`], {
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    let out = '';
+    ps.stdout.on('data', (d) => (out += d));
+    ps.on('close', () => resolve(out.trim()));
+    ps.on('error', () => resolve(''));
+  });
+
+  if (existing) {
+    info(`Reusing the demo database container "${DEMO_DB_CONTAINER}"`);
+  } else {
+    info(`Starting a Postgres container "${DEMO_DB_CONTAINER}" on port 5433...`);
+    const run = spawn(
+      'docker',
+      [
+        'run', '-d',
+        '--name', DEMO_DB_CONTAINER,
+        '-e', 'POSTGRES_USER=cakecity',
+        '-e', 'POSTGRES_PASSWORD=cakecity',
+        '-e', 'POSTGRES_DB=cakecity',
+        '-p', '5433:5432',
+        'postgres:16-alpine',
+      ],
+      { stdio: ['ignore', 'ignore', 'pipe'] }
+    );
+    let stderr = '';
+    run.stderr.on('data', (d) => (stderr += d));
+    const code = await new Promise((resolve) => {
+      run.on('close', resolve);
+      run.on('error', () => resolve(1));
+    });
+    if (code !== 0) {
+      error(stderr.trim().split('\n').pop() || 'docker run failed');
+      return false;
+    }
+  }
+
+  // Postgres initialises asynchronously; connecting immediately gets a refusal
+  // that has nothing to do with the configuration. Poll the port until it answers.
+  const { Client } = require('pg');
+  for (let attempt = 1; attempt <= 30; attempt += 1) {
+    const client = new Client({ connectionString: DEMO_DATABASE_URL });
+    try {
+      await client.connect();
+      await client.query('SELECT 1');
+      await client.end();
+      success('Demo database is ready');
+      return true;
+    } catch {
+      await client.end().catch(() => {});
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+  }
+
+  error('Postgres did not become ready in time');
+  return false;
+}
+
 async function main() {
   console.clear();
   log('╔════════════════════════════════════════╗', 'blue');
@@ -76,24 +184,64 @@ async function main() {
   // Step 1: Create .env file
   log('Step 1/5: Setting up environment...', 'yellow');
   const envPath = path.join(projectRoot, '.env');
-  const envContent = `# Cake City POS - Demo Environment
+
+  // This application speaks Postgres and nothing else — pg Pool, Postgres
+  // migrations, CHECK constraints, Postgres enums. There is no SQLite driver in
+  // package.json, and pg parses "sqlite:..." as a Postgres URL and fails with
+  // 'database "/cakecity-demo.db" does not exist'. So a SQLite URL here does not
+  // produce a lighter demo, it produces a demo that never starts.
+  //
+  // An existing .env is left completely alone, because on a developer machine it
+  // usually points at their real shop database.
+  if (fs.existsSync(envPath)) {
+    info('.env already exists, using it');
+  } else {
+    const existing = readDatabaseUrlFromEnvFiles(projectRoot);
+    let databaseUrl = existing;
+
+    if (!databaseUrl) {
+      // No configuration anywhere: start a throwaway Postgres in Docker. It is
+      // the same engine the app actually uses, so the demo exercises the real
+      // code paths instead of a substitute.
+      const started = await tryStartDemoDatabase(projectRoot);
+      if (!started) {
+        error('No database found and Docker is not available.');
+        error('');
+        error('This demo needs Postgres, which is what the app uses in production.');
+        error('Either start Docker and run this again, or create a .env by hand with:');
+        error('');
+        error('  DATABASE_URL=postgresql://USER:PASSWORD@localhost:5432/cakecity');
+        error('');
+        error('Then run this script again.');
+        process.exit(1);
+      }
+      databaseUrl = DEMO_DATABASE_URL;
+    } else {
+      info(`Using the database already configured in ${existing.source}`);
+    }
+
+    // A PIN in a committed file is a PIN in every clone of the repository. This
+    // one is generated fresh each time and printed once, so the demo owner is
+    // not reachable with a value anyone else can read.
+    const ownerPin = String(crypto.randomInt(1000, 10000));
+    const envContent = `# Cake City POS - Demo Environment
 # Auto-generated by start-demo.js
 
-DATABASE_URL=sqlite:./cakecity-demo.db
+DATABASE_URL=${databaseUrl}
 PORT=4000
 JWT_SECRET=${crypto.randomBytes(48).toString('hex')}
 CAKE_OWNER_JINA=Demo Cake Shop
-CAKE_OWNER_PIN=1234
+CAKE_OWNER_PIN=${ownerPin}
 NODE_ENV=development
 CORS_ORIGINS=*
 DISABLE_REMINDER_TIMER=false
 `;
-
-  if (!fs.existsSync(envPath)) {
     fs.writeFileSync(envPath, envContent);
     success('.env created');
-  } else {
-    info('.env already exists, skipping');
+    console.log('');
+    log(`  Owner login:  id 1   PIN ${ownerPin}`, 'cyan');
+    log('  Written to .env — this is the only time it is shown.', 'grey');
+    console.log('');
   }
 
   // Step 2: Install backend dependencies

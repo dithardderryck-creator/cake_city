@@ -29,3 +29,5 @@ OWNER-PIN.txt
 
 # local database dumps — real shop data, never commit
 backups/
+.vercel
+.env*

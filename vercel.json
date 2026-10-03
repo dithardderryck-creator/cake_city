@@ -2,6 +2,7 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "installCommand": "npm install && npm --prefix web install",
   "buildCommand": "npm run build --prefix web",
+  "devCommand": "npm --prefix web run dev",
   "outputDirectory": "web/dist",
   "functions": {
     "api/*.js": {

@@ -28,6 +28,7 @@ function listMigrationFiles() {
 }
 
 async function runMigrations() {
+  await ensureDatabaseTimezone();
   await ensureMigrationsTable();
   const { rows } = await pool.query('SELECT filename FROM schema_migrations');
   const applied = new Set(rows.map((r) => r.filename));
@@ -63,4 +64,61 @@ async function runMigrations() {
   return done;
 }
 
-module.exports = { runMigrations, listMigrationFiles };
+/**
+ * Make the shop's timezone the database's own default.
+ *
+ * src/db/pool.js asks for Africa/Dar_es_Salaam through the connection startup
+ * packet (`options=-c timezone=...`), which is session state supplied by the
+ * client. That works on a laptop talking straight to Postgres, and it stops
+ * being reliable the moment a connection pooler sits in between: Neon, PgBouncer
+ * and most managed providers hand out whichever backend connection is free, so a
+ * per-client startup parameter is not reliably honoured.
+ *
+ * It fails quietly, which is the unacceptable part. Nothing errors — the session
+ * just runs in UTC, and CURRENT_DATE then resolves to the wrong business day. The
+ * dashboard's "today", the seven-day sales axis and the ticket engine would all
+ * quietly report yesterday's takings, and near midnight the shop would appear to
+ * have sold nothing.
+ *
+ * So the default is also set on the database itself, where it applies to every
+ * session no matter who connects or through what.
+ *
+ * This cannot live in a migration file: Postgres refuses ALTER DATABASE inside a
+ * transaction block, and migrations run in one by design. So it is issued here in
+ * autocommit, once, and is safe to run repeatedly.
+ */
+async function ensureDatabaseTimezone() {
+  const tz = process.env.DB_TIMEZONE || 'Africa/Dar_es_Salaam';
+  try {
+    // Ask the server what it is called rather than parsing DATABASE_URL: the URL
+    // may carry a different database, or be a pooler URL whose path is not the
+    // database name at all.
+    const {
+      rows: [row],
+    } = await pool.query('SELECT current_database() AS name');
+    if (!row || !row.name) return null;
+    await pool.query(
+      `ALTER DATABASE ${quoteIdent(row.name)} SET timezone TO ${quoteLiteral(tz)}`
+    );
+    return tz;
+  } catch (err) {
+    // Not fatal. The startup-packet setting in pool.js still applies for direct
+    // connections, so carry on but say so rather than failing the whole deploy.
+    console.warn(
+      `[db] Could not set the database timezone to "${tz}": ${err.message}\n` +
+        '     Falling back to the per-connection setting. If "today" looks wrong on\n' +
+        '     the dashboard, this is why.'
+    );
+    return null;
+  }
+}
+
+function quoteIdent(name) {
+  return `"${String(name).replace(/"/g, '""')}"`;
+}
+
+function quoteLiteral(value) {
+  return `'${String(value).replace(/'/g, "''")}'`;
+}
+
+module.exports = { runMigrations, listMigrationFiles, ensureDatabaseTimezone };

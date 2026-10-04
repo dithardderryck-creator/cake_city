@@ -2233,10 +2233,11 @@ const resolvers = {
       // client ask for another device's prefix, and two tills would then share a
       // sequence — which is the exact collision the prefix exists to prevent.
       //
-      // Omitting kifaa is allowed (orders get a null number until the till is
-      // registered). Naming a prefix that is not active is refused — better a
-      // clear setup error than silently issuing unnumbered orders while the
-      // panel thinks it is on a till.
+      // Omitting kifaa is allowed: the order is still numbered AG0-<id> further
+      // down, so a receipt is never blank. What the prefix buys is a number that
+      // says which device issued it and that counts per day. Naming a prefix that
+      // is not active is refused — a till that believes it is registered should
+      // not quietly fall back to AG0 numbers nobody can trace back.
       let kifaaRow = null;
       if (kifaa) {
         kifaaRow = (

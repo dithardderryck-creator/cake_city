@@ -133,9 +133,10 @@ export default function Login() {
               <Lock weight="light" className="absolute right-5 bottom-[18px] w-4 h-4 text-espresso-muted/40 pointer-events-none" />
             </div>
 
-            {/* BR-26: optional, because a counter that has never been registered
-                should still be able to sign in and take money. But a registered
-                till is what gives orders a number a customer can read back. */}
+            {/* BR-26: optional. An order placed without a prefix is still numbered
+                AG0-<id>, so a receipt is never blank — what the prefix adds is a
+                number that says which till issued it and counts per day. Left
+                editable so a re-registered till picks up its new prefix. */}
             <Field
               label="Kifaa / Huduma"
               type="text"

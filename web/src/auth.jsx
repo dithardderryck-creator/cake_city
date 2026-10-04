@@ -4,13 +4,24 @@ import { useApolloClient, gql } from '@apollo/client'
 const AuthContext = createContext(null)
 
 const LOGIN_MUTATION = gql`
-  mutation Login($id: ID!, $pin: String!) {
-    login(id: $id, pin: $pin) {
+  mutation Login($id: ID!, $pin: String!, $kifaa: String) {
+    login(id: $id, pin: $pin, kifaa: $kifaa) {
       token
       mtumiaji { id jina jukumu }
+      kifaa { id alama jina }
     }
   }
 `
+
+// BR-26: the till claims its prefix once, here, and the claim rides in the token
+// from then on. Remembered so a shop types it on the first login of a device and
+// never again — but it stays editable, because a till can be re-registered with a
+// new prefix and the next login should pick that up.
+const KIFAA_KEY = 'cc_kifaa'
+
+export function savedKifaa() {
+  return localStorage.getItem(KIFAA_KEY) || ''
+}
 
 const ME_QUERY = gql`
   query Me { me { id jina jukumu } }
@@ -29,12 +40,20 @@ export function AuthProvider({ children }) {
       .catch(() => { localStorage.removeItem('cc_token'); setLoading(false) })
   }, [client])
 
-  const login = useCallback(async (id, pin) => {
-    const { data } = await client.mutate({ mutation: LOGIN_MUTATION, variables: { id, pin } })
-    const { token, mtumiaji } = data.login
+  const login = useCallback(async (id, pin, kifaa) => {
+    const alama = (kifaa || '').trim().toUpperCase()
+    const { data } = await client.mutate({
+      mutation: LOGIN_MUTATION,
+      variables: { id, pin, kifaa: alama || null },
+    })
+    const { token, mtumiaji, kifaa: till } = data.login
     localStorage.setItem('cc_token', token)
+    // Only remember a prefix the server actually accepted. Storing a rejected one
+    // would silently prefill the wrong till on every later login.
+    if (till?.alama) localStorage.setItem(KIFAA_KEY, till.alama)
+    else localStorage.removeItem(KIFAA_KEY)
     setUser(mtumiaji)
-    return mtumiaji
+    return { ...mtumiaji, kifaa: till || null }
   }, [client])
 
   const logout = useCallback(() => {

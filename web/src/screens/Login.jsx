@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { useAuth } from '../auth'
+import { useAuth, savedKifaa } from '../auth'
 import { useQuery, gql } from '@apollo/client'
 import { motion } from 'framer-motion'
 import { Cake, ArrowRight, Lock } from '@phosphor-icons/react'
@@ -23,6 +23,7 @@ export default function Login() {
   const { data } = useQuery(WAFANYAKAZI)
   const [staffId, setStaffId] = useState('')
   const [pin, setPin] = useState('')
+  const [kifaa, setKifaa] = useState(savedKifaa)
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
 
@@ -33,9 +34,13 @@ export default function Login() {
     setError('')
     setBusy(true)
     try {
-      await login(staffId, pin)
-    } catch {
-      setError('PIN si sahihi')
+      await login(staffId, pin, kifaa)
+    } catch (err) {
+      // The server distinguishes a wrong PIN from an unregistered till, and the
+      // till case is a setup problem the staff can fix by typing another prefix.
+      // Collapsing both into "PIN si sahihi" would send them hunting for the
+      // wrong thing entirely, so pass the real reason through.
+      setError(err?.graphQLErrors?.[0]?.message || 'PIN si sahihi')
       setPin('')
     } finally {
       setBusy(false)
@@ -43,6 +48,12 @@ export default function Login() {
   }
 
   const staffList = data?.wafanyakazi || []
+
+  // The one error string serves two fields. A till that is not registered is a
+  // setup mistake with its own fix — type a prefix that exists — so it belongs
+  // under the till box, not under the PIN where staff would go changing digits.
+  const tillError = error && /kifaa/i.test(error) ? error : ''
+  const pinError = tillError ? '' : error
 
   return (
     <div className="min-h-[100dvh] flex flex-col items-center justify-center px-4 py-12 md:py-24">
@@ -117,10 +128,28 @@ export default function Login() {
                 maxLength={6}
                 value={pin}
                 onChange={(e) => { setPin(e.target.value); setError('') }}
-                error={error}
+                error={pinError}
               />
               <Lock weight="light" className="absolute right-5 bottom-[18px] w-4 h-4 text-espresso-muted/40 pointer-events-none" />
             </div>
+
+            {/* BR-26: optional, because a counter that has never been registered
+                should still be able to sign in and take money. But a registered
+                till is what gives orders a number a customer can read back. */}
+            <Field
+              label="Kifaa / Huduma"
+              type="text"
+              autoComplete="off"
+              spellCheck="false"
+              placeholder="KIFAA1"
+              maxLength={12}
+              value={kifaa}
+              onChange={(e) => {
+                setKifaa(e.target.value.toUpperCase())
+                setError('')
+              }}
+              error={tillError}
+            />
 
             <Btn
               type="submit"
